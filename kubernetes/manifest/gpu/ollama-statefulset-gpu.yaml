@@ -1,0 +1,21 @@
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: ollama
+  namespace: open-webui
+spec:
+  selector:
+    matchLabels:
+      app: ollama
+  serviceName: "ollama"
+  template:
+    spec:
+      containers:
+      - name: ollama
+        image: ghcr.io/open-webui/open-webui:main
+        envFrom:
+        - secretRef:
+            name: webui-secrets 
+        resources:
+          limits:
+            nvidia.com/gpu: "2"
