@@ -23,6 +23,62 @@ kubernetes/manifest/
 
 ## Deploying
 
+### Prerequisites — secrets must exist before first apply
+
+The deployment references two secrets that Kubernetes will not create automatically.
+Create them before running `kubectl apply`:
+
+```bash
+# 1. Tailscale auth key (get a reusable key from https://login.tailscale.com/admin/settings/keys)
+microk8s kubectl create namespace open-webui   # if not already present
+microk8s kubectl create secret generic tailscale-auth \
+  --from-literal=tskey=<your-tailscale-auth-key> \
+  -n open-webui
+
+# 2. Open WebUI app secrets (can be empty to start; add WEBUI_SECRET_KEY etc. as needed)
+microk8s kubectl create secret generic webui-secrets \
+  --from-literal=WEBUI_SECRET_KEY=<random-string> \
+  -n open-webui
+```
+
+### The Ollama IP chicken-and-egg
+
+`webui-deployment.yaml` needs the MetalLB-assigned LAN IP of the Ollama service
+in `OLLAMA_BASE_URL` — but MetalLB only assigns that IP *after* the service is
+deployed. Two ways to handle this:
+
+**Option A — Two-phase deploy (quick fix):**
+1. Apply everything (Open WebUI will start but will show "cannot connect to Ollama"):
+   ```bash
+   microk8s kubectl apply -k kubernetes/manifest/gpu/
+   ```
+2. Look up the IP MetalLB gave the Ollama service:
+   ```bash
+   microk8s kubectl get svc -n open-webui
+   # Note the EXTERNAL-IP on the ollama-service row
+   ```
+3. Edit `base/webui-deployment.yaml` — replace `<LAN-IP-ollama>` with that IP,
+   then re-apply:
+   ```bash
+   microk8s kubectl apply -k kubernetes/manifest/gpu/
+   ```
+
+**Option B — Use in-cluster DNS (recommended, eliminates the problem entirely):**
+
+Because both pods live in the same `open-webui` namespace, Kubernetes DNS resolves
+the service name directly — no external IP needed:
+
+```yaml
+# in base/webui-deployment.yaml, change OLLAMA_BASE_URL to:
+value: "http://ollama-service:11434"
+```
+
+With this change you never need to know or hardcode the MetalLB IP for the
+Ollama→WebUI connection. The LoadBalancer IP is still useful for reaching the
+Ollama API directly from your LAN (e.g., with `curl` or the Ollama CLI).
+
+---
+
 **Normal deployment (CPU Ollama):**
 ```bash
 microk8s kubectl apply -k kubernetes/manifest/base/
