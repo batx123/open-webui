@@ -47,9 +47,22 @@ microk8s kubectl create secret generic webui-secrets \
 Kubernetes DNS resolves `ollama-service` within the `open-webui` namespace automatically —
 no LAN IP or MetalLB address needs to be known or hardcoded before deploying.
 
-The Ollama LoadBalancer IP (assigned by MetalLB after deploy) is still useful for
-reaching the Ollama API directly from your LAN — e.g., `curl http://<LAN-IP-ollama>:11434`
-or pulling models via the Ollama CLI from another machine.
+The Ollama LoadBalancer IP (assigned by MetalLB after deploy) is intentionally
+exposed on the LAN for direct access from other machines — this is by design.
+The Ollama backend serves multiple purposes beyond just powering the Open WebUI chat interface:
+
+- **VSCode + Continue plugin** — point Continue at `http://<LAN-IP-ollama>:11434`
+  for AI-assisted coding from any machine on the network
+- **Python scripts / notebooks** — use the Ollama REST API or the `ollama` Python
+  library directly for local LLM inference in your own projects
+- **Ollama CLI** — pull models, run prompts, and inspect model state from any
+  LAN-connected machine without needing to exec into the pod
+
+To find the assigned IP after deploying:
+```bash
+microk8s kubectl get svc -n open-webui
+# Look for the EXTERNAL-IP on the ollama-service row
+```
 
 ---
 
