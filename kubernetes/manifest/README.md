@@ -41,41 +41,15 @@ microk8s kubectl create secret generic webui-secrets \
   -n open-webui
 ```
 
-### The Ollama IP chicken-and-egg
+### Ollama connectivity — in-cluster DNS
 
-`webui-deployment.yaml` needs the MetalLB-assigned LAN IP of the Ollama service
-in `OLLAMA_BASE_URL` — but MetalLB only assigns that IP *after* the service is
-deployed. Two ways to handle this:
+`OLLAMA_BASE_URL` in `webui-deployment.yaml` is set to `http://ollama-service:11434`.
+Kubernetes DNS resolves `ollama-service` within the `open-webui` namespace automatically —
+no LAN IP or MetalLB address needs to be known or hardcoded before deploying.
 
-**Option A — Two-phase deploy (quick fix):**
-1. Apply everything (Open WebUI will start but will show "cannot connect to Ollama"):
-   ```bash
-   microk8s kubectl apply -k kubernetes/manifest/gpu/
-   ```
-2. Look up the IP MetalLB gave the Ollama service:
-   ```bash
-   microk8s kubectl get svc -n open-webui
-   # Note the EXTERNAL-IP on the ollama-service row
-   ```
-3. Edit `base/webui-deployment.yaml` — replace `<LAN-IP-ollama>` with that IP,
-   then re-apply:
-   ```bash
-   microk8s kubectl apply -k kubernetes/manifest/gpu/
-   ```
-
-**Option B — Use in-cluster DNS (recommended, eliminates the problem entirely):**
-
-Because both pods live in the same `open-webui` namespace, Kubernetes DNS resolves
-the service name directly — no external IP needed:
-
-```yaml
-# in base/webui-deployment.yaml, change OLLAMA_BASE_URL to:
-value: "http://ollama-service:11434"
-```
-
-With this change you never need to know or hardcode the MetalLB IP for the
-Ollama→WebUI connection. The LoadBalancer IP is still useful for reaching the
-Ollama API directly from your LAN (e.g., with `curl` or the Ollama CLI).
+The Ollama LoadBalancer IP (assigned by MetalLB after deploy) is still useful for
+reaching the Ollama API directly from your LAN — e.g., `curl http://<LAN-IP-ollama>:11434`
+or pulling models via the Ollama CLI from another machine.
 
 ---
 
@@ -120,8 +94,7 @@ Requires Tailscale MagicDNS HTTPS to be enabled in the Tailscale admin console.
 The `open-webui-deployment` pod runs two containers:
 
 1. **open-webui** — the chat UI, listens on port 8080, connects to Ollama at
-   `http://<LAN-IP-ollama>:11434`
-   <!-- <LAN-IP-ollama> is the MetalLB-assigned LAN IP for the ollama LoadBalancer service -->
+   `http://ollama-service:11434` (in-cluster DNS, no hardcoded IP required)
 2. **ts-sidecar** — Tailscale in userspace mode, runs an HTTPS reverse proxy
    via `TS_SERVE_CONFIG` that proxies `<your-node>.<your-tailnet>.ts.net:443` →
    `http://127.0.0.1:8080`
