@@ -4,12 +4,11 @@ metadata:
   name: open-webui-service
   namespace: open-webui
 spec:
-  type: NodePort  # Use LoadBalancer if you're on a cloud that supports it
   selector:
     app: open-webui
+  type: LoadBalancer
   ports:
-    - protocol: TCP
-      port: 8080
-      targetPort: 8080
-      # If using NodePort, you can optionally specify the nodePort:
-      # nodePort: 30000
+  - protocol: TCP
+    port: 80
+    targetPort: 8080
+    name: http

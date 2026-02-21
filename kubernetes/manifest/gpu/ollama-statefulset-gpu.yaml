@@ -12,10 +12,6 @@ spec:
     spec:
       containers:
       - name: ollama
-        image: ghcr.io/open-webui/open-webui:main
-        envFrom:
-        - secretRef:
-            name: webui-secrets 
         resources:
           limits:
             nvidia.com/gpu: "2"

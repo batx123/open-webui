@@ -4,9 +4,6 @@ resources:
   - ollama-statefulset.yaml
   - webui-deployment.yaml
   - webui-service.yaml
-  - webui-ingress.yaml
   - webui-pvc.yaml
-configMapGenerator:
-- name: webui-host
-  literals:
-    - INGRESS_HOST=demo.tail2cdce7.ts.net 
+  - tailscale-rbac.yaml
+  - tailscale-serve-config.yaml
