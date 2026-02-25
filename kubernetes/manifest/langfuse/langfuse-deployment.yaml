@@ -1,39 +1,57 @@
 apiVersion: apps/v1
 kind: Deployment
 metadata:
-  name: open-webui-deployment
-  namespace: open-webui
+  name: langfuse
+  namespace: langfuse
 spec:
   replicas: 1
   selector:
     matchLabels:
-      app: open-webui
+      app: langfuse
   template:
     metadata:
       labels:
-        app: open-webui
+        app: langfuse
     spec:
       serviceAccountName: tailscale-sa
       containers:
-      - name: open-webui
-        image: ghcr.io/open-webui/open-webui:main
+      - name: langfuse
+        image: langfuse/langfuse:2
         imagePullPolicy: Always
         env:
-        - name: OLLAMA_BASE_URL
-          value: "http://ollama-service:11434"  # In-cluster DNS — resolves within the open-webui namespace, no LAN IP needed
+        - name: DATABASE_URL
+          valueFrom:
+            secretKeyRef:
+              name: langfuse-secrets
+              key: DATABASE_URL
+        - name: NEXTAUTH_SECRET
+          valueFrom:
+            secretKeyRef:
+              name: langfuse-secrets
+              key: NEXTAUTH_SECRET
+        - name: SALT
+          valueFrom:
+            secretKeyRef:
+              name: langfuse-secrets
+              key: SALT
+        - name: NEXTAUTH_URL
+          valueFrom:
+            secretKeyRef:
+              name: langfuse-secrets
+              key: NEXTAUTH_URL
+        - name: PORT
+          value: "3000"
+        - name: HOSTNAME
+          value: "0.0.0.0"
         ports:
-        - containerPort: 8080
+        - containerPort: 3000
         resources:
-          limits:
-            cpu: "1000m"
-            memory: 1Gi
           requests:
-            cpu: "500m"
-            memory: 500Mi
-        tty: true
-        volumeMounts:
-        - mountPath: /app/backend/data
-          name: webui-volume
+            cpu: 250m
+            memory: 256Mi
+          limits:
+            cpu: 500m
+            memory: 512Mi
 
       - name: ts-sidecar
         image: ghcr.io/tailscale/tailscale:latest
@@ -42,7 +60,7 @@ spec:
         - name: TS_USERSPACE
           value: "true"
         - name: TS_HOSTNAME
-          value: "openwebui"
+          value: "langfuse"
         - name: TS_KUBE_SECRET
           value: "tailscale"
         - name: TS_AUTHKEY
@@ -64,9 +82,6 @@ spec:
           mountPath: /serve
 
       volumes:
-      - name: webui-volume
-        persistentVolumeClaim:
-          claimName: open-webui-pvc
       - name: tailscale-serve-config
         configMap:
           name: tailscale-serve-config

@@ -1,0 +1,41 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: pipelines
+  namespace: open-webui
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: pipelines
+  template:
+    metadata:
+      labels:
+        app: pipelines
+    spec:
+      containers:
+      - name: pipelines
+        image: ghcr.io/open-webui/pipelines:main
+        imagePullPolicy: Always
+        env:
+        - name: PIPELINES_API_KEY
+          valueFrom:
+            secretKeyRef:
+              name: pipelines-secret
+              key: PIPELINES_API_KEY
+        ports:
+        - containerPort: 9099
+        resources:
+          requests:
+            cpu: 250m
+            memory: 256Mi
+          limits:
+            cpu: 500m
+            memory: 512Mi
+        volumeMounts:
+        - name: pipelines-data
+          mountPath: /app/pipelines
+      volumes:
+      - name: pipelines-data
+        persistentVolumeClaim:
+          claimName: pipelines-pvc

@@ -310,3 +310,5 @@ dist
 cypress/videos
 cypress/screenshots
 .vscode/settings.json
+kubernetes/manifest/langfuse/langfuse-secret.yaml
+kubernetes/manifest/base/pipelines-secret.yaml

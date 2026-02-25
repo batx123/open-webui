@@ -1,0 +1,10 @@
+resources:
+  - namespace.yaml
+  - langfuse-secret.yaml
+  - postgres-pvc.yaml
+  - postgres-deployment.yaml
+  - postgres-service.yaml
+  - tailscale-rbac.yaml
+  - tailscale-serve-config.yaml
+  - langfuse-deployment.yaml
+  - langfuse-service.yaml
