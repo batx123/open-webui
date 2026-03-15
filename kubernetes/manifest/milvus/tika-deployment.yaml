@@ -1,0 +1,47 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: tika
+  namespace: open-webui
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: tika
+  template:
+    metadata:
+      labels:
+        app: tika
+    spec:
+      containers:
+      - name: tika
+        image: apache/tika:latest
+        ports:
+        - containerPort: 9998
+          name: http
+        readinessProbe:
+          httpGet:
+            path: /tika
+            port: 9998
+          initialDelaySeconds: 20
+          periodSeconds: 10
+        resources:
+          requests:
+            cpu: 100m
+            memory: 512Mi
+          limits:
+            cpu: 500m
+            memory: 1Gi
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: tika-service
+  namespace: open-webui
+spec:
+  ports:
+  - port: 9998
+    targetPort: 9998
+    name: http
+  selector:
+    app: tika

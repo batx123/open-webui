@@ -1,6 +1,6 @@
 # Open WebUI — Kubernetes Manifests
 
-Deploys Open WebUI, Ollama, Open WebUI Pipelines, and Langfuse (LLM tracing) onto a MicroK8s cluster across two namespaces: `open-webui` and `langfuse`.
+Deploys Open WebUI, Ollama, Open WebUI Pipelines, Langfuse (LLM tracing), and a Milvus-backed RAG pipeline onto a MicroK8s cluster across three namespaces: `open-webui`, `langfuse`, and `milvus`.
 
 ## Folder Structure
 
@@ -23,6 +23,10 @@ kubernetes/manifest/
 ├── gpu/                              # GPU overlay (extends base)
 │   ├── kustomization.yaml            # References ../base, patches Ollama for GPU
 │   └── ollama-statefulset-gpu.yaml   # Patches Ollama to use 2x nvidia.com/gpu
+├── milvus/                           # Milvus RAG overlay (extends base)
+│   ├── kustomization.yaml            # References ../base, adds Tika, patches webui env vars
+│   ├── webui-deployment-patch.yaml   # Adds VECTOR_DB, MILVUS_URI, Tika, chunking env vars
+│   └── tika-deployment.yaml          # Apache Tika content extraction service
 └── langfuse/                         # Langfuse LLM tracing (separate namespace)
     ├── kustomization.yaml
     ├── namespace.yaml                # langfuse namespace
@@ -75,6 +79,17 @@ microk8s kubectl apply -k kubernetes/manifest/base/
 ```bash
 microk8s kubectl apply -k kubernetes/manifest/gpu/
 ```
+
+**Milvus RAG (extends base — adds Tika extraction + Milvus vector store):**
+```bash
+# Deploy Milvus infrastructure first (separate namespace)
+microk8s kubectl apply -k ~/milvus/milvus/
+
+# Then deploy open-webui with Milvus overlay
+microk8s kubectl apply -k kubernetes/manifest/milvus/
+```
+
+> Note: Open WebUI will crash-loop briefly on first start if Milvus isn't ready yet — it self-recovers once Milvus passes its readiness probe (~90s).
 
 ---
 
@@ -131,6 +146,8 @@ From the Pipelines management page, paste this URL into the "Install from GitHub
 https://github.com/open-webui/pipelines/blob/main/examples/filters/langfuse_filter_pipeline.py
 ```
 
+> **Gotcha:** After pipelines pod restarts, the Python file can go missing while `valves.json` (your API keys/config) survives in the PVC. Symptom: the Pipelines admin page reverts to "click here to select a py file". Fix: reinstall from the GitHub URL above — valves are preserved and repopulate automatically.
+
 After installing, select the filter and configure its valves:
 - **Secret Key**: `sk-lf-...` (from Langfuse project → Settings → API Keys)
 - **Public Key**: `pk-lf-...` (same location)
@@ -146,9 +163,14 @@ After installing, select the filter and configure its valves:
 | open-webui (remote)  | open-webui  | Tailscale    | `https://openwebui.<tailnet>.ts.net`                |
 | ollama               | open-webui  | LoadBalancer | `http://<LAN-IP>:11434` (LAN tools, Continue, etc.) |
 | pipelines-service    | open-webui  | ClusterIP    | `http://pipelines-service:9099` (in-cluster only)   |
+| tika                 | open-webui  | ClusterIP    | `http://tika-service:9998` (in-cluster only)        |
 | langfuse             | langfuse    | Tailscale    | `https://langfuse.<tailnet>.ts.net`                 |
 | langfuse (in-cluster)| langfuse    | ClusterIP    | `http://langfuse-service.langfuse.svc.cluster.local:3000` |
 | postgres             | langfuse    | ClusterIP    | `postgres-service:5432` (in-cluster only)           |
+| milvus               | milvus      | ClusterIP    | `http://milvus-service.milvus.svc.cluster.local:19530` (in-cluster only) |
+| milvus-webui         | milvus      | LoadBalancer | `http://<LAN-IP>:9091/webui` (MetalLB)              |
+| minio                | milvus      | ClusterIP    | `minio-service.milvus.svc.cluster.local:9000` (in-cluster only) |
+| etcd                 | milvus      | ClusterIP    | `etcd-service.milvus.svc.cluster.local:2379` (in-cluster only) |
 
 ---
 
@@ -160,10 +182,21 @@ Browser (LAN/remote)
         ▼
 open-webui-deployment pod (open-webui namespace)
 ├── open-webui (:8080)
-│   ├── → http://ollama-service:11434    (Ollama, in-cluster DNS)
-│   └── → http://pipelines-service:9099  (Pipelines, registered as OpenAI connection)
-│           └── Langfuse filter → http://langfuse-service.langfuse.svc.cluster.local:3000
+│   ├── → http://ollama-service:11434              (LLM inference + embeddings)
+│   ├── → http://pipelines-service:9099            (Pipelines, registered as OpenAI connection)
+│   │       └── Langfuse filter → http://langfuse-service.langfuse.svc.cluster.local:3000
+│   ├── → http://tika-service:9998                 (PDF/HTML content extraction)
+│   └── → http://milvus-service.milvus.svc.cluster.local:19530  (vector store)
 └── ts-sidecar (Tailscale, proxies :443 → :8080)
+
+RAG pipeline (document upload flow):
+  PDF/doc → Tika (extract + clean) → chunks → mxbai-embed-large (Ollama) → Milvus vectors
+  Query   → mxbai-embed-large (embed) → Milvus (ANN search) → top-k chunks → LLM prompt
+
+milvus namespace
+├── milvus-standalone (:19530 gRPC, :9091 WebUI/metrics)
+├── minio (:9000) — object storage for Milvus segments
+└── etcd (:2379)  — Milvus metadata store
 
 langfuse pod (langfuse namespace)
 ├── langfuse (:3000) → postgres-service:5432
@@ -220,6 +253,7 @@ microk8s kubectl rollout restart deployment/langfuse -n langfuse
 **Check all pods:**
 ```bash
 microk8s kubectl get pods -n open-webui
+microk8s kubectl get pods -n milvus
 microk8s kubectl get pods -n langfuse
 ```
 
@@ -227,6 +261,7 @@ microk8s kubectl get pods -n langfuse
 ```bash
 microk8s kubectl rollout restart deployment/open-webui-deployment -n open-webui
 microk8s kubectl rollout restart statefulset/ollama -n open-webui
+microk8s kubectl rollout restart deployment/milvus-standalone -n milvus
 microk8s kubectl rollout restart deployment/langfuse -n langfuse
 ```
 
@@ -235,6 +270,8 @@ microk8s kubectl rollout restart deployment/langfuse -n langfuse
 microk8s kubectl logs -n open-webui deploy/open-webui-deployment -c open-webui
 microk8s kubectl logs -n open-webui deploy/open-webui-deployment -c ts-sidecar
 microk8s kubectl logs -n open-webui deploy/pipelines
+microk8s kubectl logs -n open-webui deploy/tika
+microk8s kubectl logs -n milvus deploy/milvus-standalone
 microk8s kubectl logs -n langfuse deploy/langfuse -c langfuse
 ```
 

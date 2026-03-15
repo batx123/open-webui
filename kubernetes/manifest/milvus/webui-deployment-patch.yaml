@@ -1,0 +1,44 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: open-webui-deployment
+  namespace: open-webui
+spec:
+  template:
+    spec:
+      containers:
+      - name: open-webui
+        env:
+        # ── Vector store ──────────────────────────────────────────────────────
+        - name: VECTOR_DB
+          value: "milvus"
+        - name: MILVUS_URI
+          value: "http://milvus-service.milvus.svc.cluster.local:19530"
+
+        # ── RAG content extraction ────────────────────────────────────────────
+        # "tika" gives HTML-aware extraction → cleaner chunks, richer metadata.
+        # Requires the tika sidecar/service below. Swap to "default" to skip Tika.
+        - name: CONTENT_EXTRACTION_ENGINE
+          value: "tika"
+        - name: TIKA_SERVER_URL
+          value: "http://tika-service.open-webui.svc.cluster.local:9998"
+
+        # ── Chunking ──────────────────────────────────────────────────────────
+        - name: CHUNK_SIZE
+          value: "1500"
+        - name: CHUNK_OVERLAP
+          value: "150"
+
+        # ── Embedding ─────────────────────────────────────────────────────────
+        # Set to "ollama" if embedding via local Ollama, or "openai" for OpenAI.
+        # RAG_EMBEDDING_MODEL must match a model available in the chosen engine.
+        - name: RAG_EMBEDDING_ENGINE
+          value: "ollama"
+        - name: RAG_EMBEDDING_MODEL
+          value: "mxbai-embed-large:latest"
+
+        # ── Retrieval quality ─────────────────────────────────────────────────
+        - name: RAG_RERANKING_MODEL_AUTO_SELECT
+          value: "true"
+        - name: RAG_TOP_K
+          value: "5"
