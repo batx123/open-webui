@@ -6,6 +6,19 @@ metadata:
 spec:
   template:
     spec:
+      initContainers:
+      - name: wait-for-milvus
+        image: busybox:1.36
+        command:
+        - sh
+        - -c
+        - |
+          echo "Waiting for Milvus at milvus-service.milvus.svc.cluster.local:19530..."
+          until nc -z milvus-service.milvus.svc.cluster.local 19530; do
+            echo "Milvus not ready, retrying in 5s..."
+            sleep 5
+          done
+          echo "Milvus is ready."
       containers:
       - name: open-webui
         env:
