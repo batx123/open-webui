@@ -26,10 +26,10 @@ spec:
         resources:
           limits:
             cpu: "1000m"
-            memory: 1Gi
+            memory: 2Gi
           requests:
             cpu: "500m"
-            memory: 500Mi
+            memory: 768Mi
         tty: true
         volumeMounts:
         - mountPath: /app/backend/data
@@ -55,10 +55,10 @@ spec:
         resources:
           limits:
             cpu: 200m
-            memory: 128Mi
+            memory: 256Mi
           requests:
             cpu: 100m
-            memory: 64Mi
+            memory: 96Mi
         volumeMounts:
         - name: tailscale-serve-config
           mountPath: /serve

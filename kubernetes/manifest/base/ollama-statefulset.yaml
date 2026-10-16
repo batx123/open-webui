@@ -14,9 +14,11 @@ spec:
       labels:
         app: ollama
     spec:
+      imagePullSecrets:
+      - name: harbor-creds
       containers:
       - name: ollama
-        image: ollama/ollama:latest
+        image: 192.168.1.5/microk8s/ollama:latest
         imagePullPolicy: Always
         ports:
         - containerPort: 11434
@@ -26,7 +28,18 @@ spec:
             memory: "8Gi"
           limits:
             cpu: "4000m"
-            memory: "20Gi"
+            memory: "48Gi"
+        env:
+        - name: OLLAMA_ORIGINS
+          value: "*"
+        - name: OLLAMA_KEEP_ALIVE
+          value: "24h"
+        - name: OLLAMA_MAX_LOADED_MODELS
+          value: "6"
+        - name: OLLAMA_CONTEXT_LENGTH
+          value: "32768"
+        - name: OLLAMA_KV_CACHE_TYPE
+          value: "q8_0"
         volumeMounts:
         - name: ollama-volume
           mountPath: /root/.ollama
