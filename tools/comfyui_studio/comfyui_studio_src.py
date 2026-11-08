@@ -444,8 +444,9 @@ class Tools:
                     await self._status(__event_emitter__, f"{label}: {c['name']} reference sheet")
                     w, h = _IMAGE_SIZES["landscape"]
                     data = await self._comfy(self._t2i_wf(
-                        f"Character reference image: {c['description']}. Only this one character, full body, standing, "
-                        f"centered, facing the camera, clearly visible, plain simple neutral background. {style}.", w, h),
+                        f"Character reference image: {c['description']}. Only this one character, full body, standing in a "
+                        f"relaxed natural three-quarter view, neutral expression, clearly visible, plain simple neutral "
+                        f"background. {style}.", w, h),
                         _IMG["save"], self.valves.IMAGE_TIMEOUT, f"{label}: {c['name']} sheet", __event_emitter__)
                 c["sheet_file"] = await self._publish("image", data, "image/png", *ctx)
                 c["_up"] = await self._upload(data)
@@ -605,6 +606,9 @@ class Tools:
         who = "; ".join(f"the {c['name']} is {c['description']}" for c in cast)
         lock = ("Each character keeps exactly its own design, colors, materials and proportions; colored lights, "
                 "reflections and props must not change any character's colors.")
+        candid = ("This is a candid frame from a film, not a portrait: the characters are caught mid-action, in the poses "
+                  "and with the expressions the scene calls for, looking at each other or at what is happening, never "
+                  "at the camera and never posing or smiling for the camera.")
         kf_id = None
         if cont:
             with tempfile.TemporaryDirectory() as tmp:
@@ -618,7 +622,7 @@ class Tools:
                 pics = "".join(f" The {c['name']} must look exactly like the one in Picture {k + 2}." for k, c in enumerate(cast[:2]))
                 start = await self._comfy(self._edit_wf(await self._upload(start),
                     f"Continue this exact moment from Picture 1 (same place, same characters, same lighting): {scene}.{pics} "
-                    f"{who + '. ' if who else ''}{lock} Style: {style}.", refs),
+                    f"{who + '. ' if who else ''}{candid} {lock} Style: {style}.", refs),
                     _EDIT["save"], self.valves.IMAGE_TIMEOUT, f"{tag}: keyframe", ctx[5])
                 kf_id = await self._publish("image", start, "image/png", *ctx)
         elif cast:
@@ -627,7 +631,8 @@ class Tools:
             only = "No other characters appear." if len(cast) else ""
             start = await self._comfy(self._edit_wf(cast[0]["_up"],
                 f"Create a new image showing {pics} in this scene: {scene}. {who}. Keep every character exactly as in its "
-                f"picture. Replace the whole background with the scene. {only} {lock} Style: {style}.",
+                f"picture, but in the pose the scene describes. Replace the whole background with the scene. {only} "
+                f"{candid} {lock} Style: {style}.",
                 [c["_up"] for c in cast[1:]]),
                 _EDIT["save"], self.valves.IMAGE_TIMEOUT, f"{tag}: keyframe", ctx[5])
             kf_id = await self._publish("image", start, "image/png", *ctx)
@@ -640,7 +645,8 @@ class Tools:
         w, h = self._video_size_for(start)
         await self._status(ctx[5], f"{tag}: animating")
         clip = await self._comfy(self._i2v_wf(await self._upload(start),
-            f"{action}. {who + '. ' if who else ''}{lock} {style}. Smooth, natural, clearly visible motion.", w, h, secs),
+            f"{action}. {who + '. ' if who else ''}The characters act naturally and never look at the camera. {lock} "
+            f"{style}. Smooth, natural, clearly visible motion.", w, h, secs),
             _I2V["save"], self.valves.VIDEO_TIMEOUT, f"{tag}: animating", ctx[5])
         return clip, kf_id
 
