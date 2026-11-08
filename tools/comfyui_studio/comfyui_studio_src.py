@@ -54,6 +54,11 @@ class Tools:
         AUDIO_TIMEOUT: int = Field(default=900, description="Seconds to wait for music.")
         MAX_VIDEO_SECONDS: int = Field(default=8, description="Wan2.2 degrades past ~8 s per clip.")
         MAX_MUSIC_SECONDS: int = Field(default=240, description="Upper limit for generated music.")
+        QA_ENABLED: bool = Field(default=True, description="Check story-film keyframes with a vision model and redraw failures.")
+        QA_RETRIES: int = Field(default=1, description="How many times a failed keyframe is redrawn.")
+        QA_MODEL: str = Field(default="qwen3.8:27b", description="Ollama vision model used for keyframe checks.")
+        OLLAMA_URL: str = Field(default="http://ollama-service:11434", description="Ollama API base URL, as seen from the Open WebUI pod.")
+        QA_TIMEOUT: int = Field(default=180, description="Seconds to wait for one keyframe check.")
 
     def __init__(self):
         self.valves = self.Valves()
@@ -428,7 +433,7 @@ class Tools:
             return self._error(f"Give 2-10 shots (got {len(plan)}); 4-8 shots of 3-5 s make a 15-30 s film.")
         names = [c["name"] for c in cast_list]
         for shot in plan:
-            shot["cast"] = [c for c in shot.get("cast", names) if c in names][:3]
+            shot["cast"] = self._match_cast(shot["cast"], cast_list) if "cast" in shot else names[:3]
         plan[0]["continue"] = False
         secs = max(3, min(int(seconds_per_shot or 4), 5))
         fade = 0.4 if str(transitions).strip().lower().startswith("cross") else 0.0
@@ -537,8 +542,10 @@ class Tools:
             if (val or "").strip():
                 plan[k - 1][key] = val.strip()
         if (cast or "").strip():
-            names = [c["name"] for c in cast_list]
-            plan[k - 1]["cast"] = [n.strip() for n in cast.split(",") if n.strip() in names][:3]
+            matched = self._match_cast(cast, cast_list)
+            if not matched:
+                return self._error(f"cast {cast!r} matches none of the characters: {', '.join(c['name'] for c in cast_list)}.")
+            plan[k - 1]["cast"] = matched
         style = project["style"]
         label = f"Redoing shot {k}"
         t0 = time.monotonic()
@@ -622,6 +629,18 @@ class Tools:
         return cl
 
     @staticmethod
+    def _norm(name) -> str:
+        n = re.sub(r"\s+", " ", str(name or "")).strip().lower()
+        return n[4:] if n.startswith("the ") else n
+
+    def _match_cast(self, wanted, cast_list) -> list:
+        """Canonical names (story order) for a cast given in any case/spacing, e.g. "Mira, the Pip" -> ["mira", "pip"]."""
+        if isinstance(wanted, str):
+            wanted = [w for w in wanted.split(",")]
+        want = {self._norm(w) for w in (wanted or [])}
+        return [c["name"] for c in cast_list if self._norm(c["name"]) in want][:3]
+
+    @staticmethod
     def _shot_secs(project) -> float:
         n = len(project["shots"])
         fade = float(project.get("crossfade") or 0)
@@ -642,10 +661,12 @@ class Tools:
                     _IMG["save"], self.valves.IMAGE_TIMEOUT, f"{label}: {c['name']} sheet", emitter)
             c["sheet_file"] = await self._publish("image", data, "image/png", *ctx)
             c["_up"] = await self._upload(data)
+            c["_img"] = data
 
     async def _upload_sheets(self, cast_list, user):
         for c in cast_list:
-            c["_up"] = await self._upload(await self._read_file(c["sheet_file"], user))
+            c["_img"] = await self._read_file(c["sheet_file"], user)
+            c["_up"] = await self._upload(c["_img"])
 
     async def _load_project(self, film_ref, metadata, chat_id, message_id, user) -> dict:
         projects = [p for p in await self._chat_media(metadata, chat_id, message_id, "application/json")
@@ -669,12 +690,16 @@ class Tools:
             return open(f, "rb").read()
 
     def _prompt_bits(self, shot, cast_list):
-        by_name = {c["name"]: c for c in cast_list}
-        cast = [by_name[c] for c in shot.get("cast", []) if c in by_name][:3]
+        wanted = {self._norm(c) for c in shot.get("cast", [])}
+        # keep the story's character order (main character first): Picture 1 is the edit's base image and its
+        # features leak most, so it should not depend on how a shot happens to list its cast
+        cast = [c for c in cast_list if self._norm(c["name"]) in wanted][:3]
         who = "; ".join(f"the {c['name']} is {c['description']}" for c in cast)
         expr = str(shot.get("expression") or "").strip()
         lock = ("Each character keeps exactly its own design, colors, materials and proportions; colored lights, "
-                "reflections and props must not change any character's colors.")
+                "reflections and props must not change any character's colors. Each character has only its own anatomy "
+                "and features as in its picture: wings, horns, tails, fur, scales, colors or clothes of one character never "
+                "appear on another.")
         candid = ("This is a candid frame from a film, not a portrait: the characters are caught mid-action, in the poses "
                   "and with the expressions the scene calls for, looking at each other or at what is happening, never "
                   "at the camera and never posing or smiling for the camera.")
@@ -695,34 +720,113 @@ class Tools:
         """Keyframe for one shot -> (png bytes or None, published file id or None).
 
         base = image to continue from (previous clip's last frame, or in a storyboard the previous keyframe) for
-        "continue" shots; a continue shot without its own scene has no keyframe of its own (returns None, None)."""
+        "continue" shots; a continue shot without its own scene has no keyframe of its own (returns None, None).
+        With QA_ENABLED, the keyframe is checked by a vision model against the shot plan and redrawn once with the
+        reported problems as extra instructions."""
         emitter = ctx[5]
         cast, who, lock, candid, feel = self._prompt_bits(shot, cast_list)
         scene = str(shot.get("scene") or "").strip()
         tag = f"{label}: shot {i}/{n}"
-        if shot.get("continue") and base is not None:
-            if not scene:
-                return None, None
-            await self._status(emitter, f"{tag}: keyframe (continuing)")
-            pics = "".join(f" The {c['name']} must look exactly like the one in Picture {k + 2}." for k, c in enumerate(cast[:2]))
-            img = await self._comfy(self._edit_wf(await self._upload(base),
-                f"Continue this exact moment from Picture 1 (same place, same characters, same lighting): {scene}.{pics} "
-                f"{who + '. ' if who else ''}{feel} {candid} {lock} Style: {style}.", [c["_up"] for c in cast][:2]),
-                _EDIT["save"], self.valves.IMAGE_TIMEOUT, f"{tag}: keyframe", emitter)
-        elif cast:
-            await self._status(emitter, f"{tag}: keyframe")
-            pics = " and ".join(f"the {c['name']} from Picture {k + 1}" for k, c in enumerate(cast))
-            img = await self._comfy(self._edit_wf(cast[0]["_up"],
-                f"Create a new image showing {pics} in this scene: {scene}. {who}. Keep every character exactly as in its "
-                f"picture, but in the pose the scene describes. {feel} Replace the whole background with the scene. "
-                f"No other recurring characters appear. {candid} {lock} Style: {style}.", [c["_up"] for c in cast[1:]]),
-                _EDIT["save"], self.valves.IMAGE_TIMEOUT, f"{tag}: keyframe", emitter)
-        else:  # no recurring character (establishing shot, landscape, ...)
-            await self._status(emitter, f"{tag}: keyframe")
-            w, h = _IMAGE_SIZES["landscape"]
-            img = await self._comfy(self._t2i_wf(f"{scene}. {feel} {style}.", w, h), _IMG["save"],
-                                    self.valves.IMAGE_TIMEOUT, f"{tag}: keyframe", emitter)
+        if shot.get("continue") and base is not None and not scene:
+            return None, None
+        base_up = await self._upload(base) if (shot.get("continue") and base is not None) else None
+
+        async def draw(fix: str) -> bytes:
+            fix = f" Fix these problems from the previous attempt: {fix}." if fix else ""
+            if base_up:
+                pics = "".join(f" The {c['name']} must look exactly like the one in Picture {k + 2}." for k, c in enumerate(cast[:2]))
+                return await self._comfy(self._edit_wf(base_up,
+                    f"Continue this exact moment from Picture 1 (same place, same characters, same lighting): {scene}.{pics} "
+                    f"{who + '. ' if who else ''}{feel}{fix} {candid} {lock} Style: {style}.", [c["_up"] for c in cast][:2]),
+                    _EDIT["save"], self.valves.IMAGE_TIMEOUT, f"{tag}: keyframe", emitter)
+            if cast:
+                pics = " and ".join(f"the {c['name']} from Picture {k + 1}" for k, c in enumerate(cast))
+                return await self._comfy(self._edit_wf(cast[0]["_up"],
+                    f"Create a new image showing {pics} in this scene: {scene}. {who}. Keep every character exactly as in its "
+                    f"picture, but in the pose the scene describes. {feel}{fix} Replace the whole background with the scene. "
+                    f"No other recurring characters appear. {candid} {lock} Style: {style}.", [c["_up"] for c in cast[1:]]),
+                    _EDIT["save"], self.valves.IMAGE_TIMEOUT, f"{tag}: keyframe", emitter)
+            w, h = _IMAGE_SIZES["landscape"]  # no recurring character (establishing shot, landscape, ...)
+            return await self._comfy(self._t2i_wf(f"{scene}. {feel}{fix} {style}.", w, h), _IMG["save"],
+                                     self.valves.IMAGE_TIMEOUT, f"{tag}: keyframe", emitter)
+
+        await self._status(emitter, f"{tag}: keyframe" + (" (continuing)" if base_up else ""))
+        img = await draw("")
+        if self.valves.QA_ENABLED:
+            ok, problems = await self._qa_check(img, shot, cast, cast_list, tag, emitter)
+            if ok:
+                shot["qa"] = "passed"
+            else:
+                first = problems
+                for _ in range(max(0, int(self.valves.QA_RETRIES))):
+                    await self._status(emitter, f"{tag}: redrawing keyframe ({'; '.join(problems)[:120]})")
+                    img = await draw("; ".join(problems))
+                    ok, problems = await self._qa_check(img, shot, cast, cast_list, tag, emitter)
+                    if ok:
+                        break
+                shot["qa"] = ("fixed: " + "; ".join(first)) if ok else ("unresolved: " + "; ".join(problems))
         return img, await self._publish("image", img, "image/png", *ctx)
+
+    async def _qa_check(self, img: bytes, shot: dict, cast: list, cast_list: list, tag: str, emitter) -> tuple:
+        """Ask a vision model whether a keyframe matches its shot plan -> (ok, [problems]). Errors count as ok."""
+        try:
+            await self._status(emitter, f"{tag}: checking keyframe")
+            refs = [c for c in cast if c.get("_img")]
+            absent = [c["name"] for c in cast_list if c not in cast]
+            lines = [f"{k + 1}) {c['name']}: {c['description']}" for k, c in enumerate(refs)]
+            prompt = (
+                "You check one keyframe of a short film against its shot plan. "
+                + (f"The first {len(refs)} image(s) are reference pictures of the recurring characters, in this order:\n"
+                   + "\n".join(lines) + "\n" if refs else "")
+                + "The LAST image is the keyframe to check.\n"
+                f"Shot plan - scene: {shot.get('scene') or '(continues the previous shot)'}\n"
+                f"expression/mood: {shot.get('expression') or '-'}\n"
+                f"must show (each exactly once): {', '.join(c['name'] for c in cast) or 'none of the recurring characters'}\n"
+                f"must NOT show: {', '.join(absent) or '-'}\n"
+                "Fail ONLY for these serious problems: (1) a listed character is missing, appears more than once, or clearly "
+                "does not resemble its reference picture (face, hair, outfit, colors, body shape); (2) another person or "
+                "creature is a look-alike copy of a listed character; (3) a character that must not be shown appears; "
+                "(4) a character has body parts or features it does not have in its reference picture, especially ones "
+                "belonging to another character (e.g. wings, horns, tail, armor); (5) the setting is completely wrong, or "
+                "the camera viewpoint/direction contradicts the plan; (6) the characters pose or smile for the camera.\n"
+                "Do NOT fail for poses, hand positions, props, exact expressions, lighting or composition details.\n"
+                'Reply with JSON only: {"pass": true or false, "problems": ["short, specific instruction that would fix it", ...]}. '
+                "problems must be empty when pass is true."
+            )
+            images = [self._small_b64(c["_img"], 448) for c in refs] + [self._small_b64(img, 896)]
+            base = self.valves.OLLAMA_URL.rstrip("/")
+            async with aiohttp.ClientSession() as s:
+                num_ctx = None
+                async with s.get(f"{base}/api/ps", timeout=aiohttp.ClientTimeout(total=10)) as r:
+                    for m in (await r.json()).get("models", []):
+                        if m.get("name") == self.valves.QA_MODEL:
+                            num_ctx = m.get("context_length")  # reuse it so Ollama doesn't reload the model
+                body = {"model": self.valves.QA_MODEL, "stream": False, "think": False, "format": "json",
+                        "messages": [{"role": "user", "content": prompt, "images": images}],
+                        "options": {"temperature": 0, **({"num_ctx": num_ctx} if num_ctx else {})}}
+                async with s.post(f"{base}/api/chat", json=body,
+                                  timeout=aiohttp.ClientTimeout(total=self.valves.QA_TIMEOUT)) as r:
+                    out = (await r.json()).get("message", {}).get("content", "")
+            verdict = json.loads(out[out.find("{"): out.rfind("}") + 1])
+            problems = [str(p) for p in verdict.get("problems") or [] if str(p).strip()][:4]
+            ok = bool(verdict.get("pass")) or not problems
+            return ok, problems
+        except Exception:
+            return True, []
+
+    @staticmethod
+    def _small_b64(data: bytes, max_side: int) -> str:
+        try:
+            from PIL import Image
+
+            im = Image.open(io.BytesIO(data)).convert("RGB")
+            im.thumbnail((max_side, max_side))
+            buf = io.BytesIO()
+            im.save(buf, "JPEG", quality=85)
+            data = buf.getvalue()
+        except Exception:
+            pass
+        return base64.b64encode(data).decode()
 
     async def _shot_start(self, i, n, shot, prev_clip, cast_list, style, label, ctx, use_keyframe) -> tuple:
         """Start frame for animating a shot -> (png bytes, keyframe file id or None)."""
@@ -764,10 +868,9 @@ class Tools:
         return movie, total
 
     def _clean_project(self, project) -> bytes:
-        p = json.loads(json.dumps(project, default=str))
-        for c in p.get("characters", []):
-            c.pop("_up", None)
-        return json.dumps(p, indent=1).encode()
+        p = dict(project)
+        p["characters"] = [{k: v for k, v in c.items() if not k.startswith("_")} for c in project.get("characters", [])]
+        return json.dumps(p, indent=1, default=str).encode()
 
     async def _finish_storyboard(self, project, took, label, ctx) -> Any:
         request, user, metadata, chat_id, message_id, emitter = ctx
@@ -776,14 +879,16 @@ class Tools:
         except Exception as e:
             return self._error(f"Storyboard made, but saving to Open WebUI failed: {type(e).__name__}: {e}")
         await self._status(emitter, f"{label}: done in {round(took)}s", done=True)
-        shots = [{"shot": i, "keyframe": bool(s.get("keyframe_file")), "cast": s.get("cast"),
+        shots = [{"shot": i, "keyframe": bool(s.get("keyframe_file")), "cast": s.get("cast"), "check": s.get("qa", "-"),
                   "note": "" if s.get("keyframe_file") else "continues from the previous shot (no keyframe of its own)"}
                  for i, s in enumerate(project["shots"], start=1)]
         return json.dumps({"status": "success", "storyboard": True, "seconds_taken": round(took), "shots": shots,
                            "message": "The storyboard (character sheets + one keyframe per shot) is already visible to the "
-                                      "user. Do not repeat links. List the shots briefly by number and ask the user to "
+                                      "user. Do not repeat links. List the shots briefly by number (mention any shot whose "
+                                      "automatic check is 'unresolved' and what is wrong) and ask the user to "
                                       "approve or request changes. Changes: redo_shot(shot=N, scene/expression/cast...). "
-                                      "When approved: animate_storyboard()."})
+                                      "When approved: animate_storyboard(). Do NOT call any tool now: wait for the "
+                                      "user's reply."})
 
     async def _finish_film(self, movie, total, project, took, label, ctx, report) -> Any:
         request, user, metadata, chat_id, message_id, emitter = ctx
@@ -795,11 +900,15 @@ class Tools:
         except Exception as e:
             return self._error(f"Film made, but saving to Open WebUI failed: {type(e).__name__}: {e}")
         await self._status(emitter, f"{label}: {round(total, 1)}s film in {round(took / 60, 1)} min", done=True)
+        checks = {i: s.get("qa") for i, s in enumerate(project["shots"], start=1)
+                  if s.get("qa") and str(s.get("qa")).startswith("unresolved")}
         status = {"status": "success", "minutes_taken": round(took / 60, 1), "film_seconds": round(total, 1),
-                  "film_number": len(films), "shots": report,
+                  "film_number": len(films), "shots": report, "keyframe_checks": checks or "all passed",
                   "message": "The finished film (with soundtrack) and the keyframes are already visible to the user. "
                              "Do not repeat links; briefly describe the film shot by shot (shot numbers), and mention "
-                             "that any single shot can be changed with redo_shot."}
+                             "that any single shot can be changed with redo_shot. keyframe_checks is information for the "
+                             "user only: mention any unresolved item in one line, but do NOT call redo_shot or any other "
+                             "tool unless the user asks for it in their next message."}
         return HTMLResponse(content=self._media_embed("video", movie, "video/mp4", True),
                             headers={"Content-Disposition": "inline"}), json.dumps(status)
 
