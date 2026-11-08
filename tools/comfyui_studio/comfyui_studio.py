@@ -27,7 +27,8 @@ _TEMPLATES: dict = json.loads('{"z_image_turbo": {"9": {"inputs": {"filename_pre
 
 # Node IDs from the exported templates (same as Ollama Studio's comfyui_common.py).
 _IMG = {"prompt": "57:27", "latent": "57:13", "sampler": "57:3", "save": "9"}
-_EDIT = {"image": "78", "prompt": "435", "sampler": "433:3", "save": "60"}
+_EDIT = {"image": "78", "prompt": "435", "sampler": "433:3", "save": "60",
+         "encoders": ("433:110", "433:111")}  # TextEncodeQwenImageEditPlus (neg, pos): image2/image3 = extra refs
 _T2V = {"prompt": "89", "latent": "74", "sampler": "81", "createvideo": "88", "save": "80"}
 _I2V = {"image": "97", "prompt": "129:93", "latent": "129:98", "sampler": "129:86",
         "lora": "129:131", "createvideo": "129:94", "save": "108"}
@@ -96,6 +97,7 @@ class Tools:
         self,
         instruction: str,
         image_ref: str = "latest",
+        character_refs: str = "",
         __request__=None,
         __user__: dict = None,
         __metadata__: dict = None,
@@ -116,6 +118,10 @@ class Tools:
         :param image_ref: Which image to start from: "latest" (default: the newest image in the chat, or the one the user
             just attached), "previous", "first", or an image number such as "1" (every image result reports its number).
             To keep a character consistent in a new scene, pass the number of the image that shows that character best.
+        :param character_refs: Optional. Up to 2 more image numbers (e.g. "1" or "1,3") used as identity references, so a
+            character/object looks the same as in those images. The base image (image_ref) is "Picture 1" and the
+            references are "Picture 2" and "Picture 3": refer to them that way in the instruction, e.g. "Show the robot from
+            Picture 2 walking in a sunny park; keep its brass color and blue eyes exactly as in Picture 2".
         :return: Status JSON. The edited image is already shown to the user in the chat.
         """
         try:
@@ -131,9 +137,20 @@ class Tools:
         wf[_EDIT["image"]]["inputs"]["image"] = uploaded
         wf[_EDIT["prompt"]]["inputs"]["value"] = instruction
         wf[_EDIT["sampler"]]["inputs"]["seed"] = random.randint(0, 2**32 - 1)
+        ref_names = []
+        for n, ref in enumerate([r for r in re.split(r"[^0-9]+", character_refs or "") if r][:2], start=2):
+            try:
+                ref_bytes, ref_name = await self._pick_image(__user__, __metadata__, __chat_id__, __message_id__, ref)
+                ref_up = await self._upload(ref_bytes)
+            except Exception as e:
+                return self._error(f"character_refs: {e}")
+            wf[f"ref{n}"] = {"class_type": "LoadImage", "inputs": {"image": ref_up}}
+            for enc in _EDIT["encoders"]:
+                wf[enc]["inputs"][f"image{n}"] = [f"ref{n}", 0]
+            ref_names.append(ref_name)
         return await self._run(
             "image", wf, _EDIT["save"], "image/png", self.valves.IMAGE_TIMEOUT,
-            f"Editing {src_name}",
+            f"Editing {src_name}" + (f" with {' and '.join(ref_names)} as character reference" if ref_names else ""),
             __request__, __user__, __metadata__, __chat_id__, __message_id__, __event_emitter__,
         )
 
@@ -276,6 +293,153 @@ class Tools:
             __request__, __user__, __metadata__, __chat_id__, __message_id__, __event_emitter__,
         )
 
+    async def make_movie(
+        self,
+        video_refs: str = "all",
+        soundtrack: str = "clips",
+        song_ref: str = "latest",
+        music_style: str = "",
+        __request__=None,
+        __user__: dict = None,
+        __metadata__: dict = None,
+        __chat_id__: str = None,
+        __message_id__: str = None,
+        __event_emitter__: Callable[[dict], Any] = None,
+    ) -> Any:
+        """
+        Combine video clips from this chat into one movie (in order), e.g. to finish a story. Runs ffmpeg; no new
+        video is generated, so it takes seconds (a new soundtrack adds ~10-20 s).
+
+        :param video_refs: "all" (default: every video in the chat, oldest first) or video numbers in the order to use, e.g. "1,2,3".
+        :param soundtrack: "clips" (default: keep each clip's own audio), "song" (use a music track already made in this chat, see song_ref),
+            "new" (generate one continuous track for the whole movie from music_style) or "none" (silent).
+        :param song_ref: For soundtrack="song": "latest" (default) or an audio number.
+        :param music_style: For soundtrack="new": music style tags, e.g. "warm hopeful orchestral, strings, piano".
+        :return: Status JSON. The movie is already shown to the user in the chat.
+        """
+        import os
+        import tempfile
+
+        videos = await self._chat_media(__metadata__, __chat_id__, __message_id__, "video/")
+        if not videos:
+            return self._error("There are no videos in this chat yet.")
+        ref = (video_refs or "all").strip().lower()
+        if ref in ("", "all"):
+            chosen = list(range(len(videos)))
+        else:
+            chosen = [int(n) - 1 for n in re.split(r"[^0-9]+", ref) if n]
+            bad = [i + 1 for i in chosen if not 0 <= i < len(videos)]
+            if bad or not chosen:
+                return self._error(f"video_refs {video_refs!r}: this chat has {len(videos)} video(s), numbered 1-{len(videos)}.")
+        mode = (soundtrack or "clips").strip().lower()
+        if mode not in ("clips", "song", "new", "none"):
+            return self._error('soundtrack must be "clips", "song", "new" or "none".')
+        label = f"Making a movie from {len(chosen)} clip(s)"
+        await self._status(__event_emitter__, label)
+        t0 = time.monotonic()
+        try:
+            with tempfile.TemporaryDirectory() as tmp:
+                clips = []
+                for k, i in enumerate(chosen):
+                    data = await self._read_file(videos[i]["id"], __user__) if videos[i]["id"] else None
+                    if not data:
+                        return self._error(f"Could not read video #{i + 1}.")
+                    path = os.path.join(tmp, f"clip{k}.mp4")
+                    open(path, "wb").write(data)
+                    clips.append(path)
+                w, h = await self._probe_size(clips[0])
+                parts = []
+                for k, c in enumerate(clips):  # normalise size/fps, give every clip an audio track
+                    out = os.path.join(tmp, f"norm{k}.mp4")
+                    has_audio = await self._has_audio(c)
+                    cmd = ["ffmpeg", "-y", "-v", "error", "-i", c]
+                    if not has_audio:
+                        cmd += ["-f", "lavfi", "-i", "anullsrc=r=44100:cl=stereo"]
+                    cmd += ["-vf", f"scale={w}:{h}:force_original_aspect_ratio=decrease,pad={w}:{h}:(ow-iw)/2:(oh-ih)/2,fps=16,format=yuv420p",
+                            "-c:v", "libx264", "-preset", "veryfast", "-crf", "18", "-c:a", "aac", "-ar", "44100", "-ac", "2"]
+                    if not has_audio:
+                        cmd += ["-shortest"]
+                    await self._ffmpeg(cmd + [out])
+                    parts.append(out)
+                listing = os.path.join(tmp, "list.txt")
+                open(listing, "w").write("".join(f"file '{p}'\n" for p in parts))
+                joined = os.path.join(tmp, "joined.mp4")
+                await self._ffmpeg(["ffmpeg", "-y", "-v", "error", "-f", "concat", "-safe", "0", "-i", listing, "-c", "copy", joined])
+                total = await self._duration(joined)
+                final = joined
+                if mode in ("song", "new", "none"):
+                    final = os.path.join(tmp, "final.mp4")
+                    if mode == "none":
+                        await self._ffmpeg(["ffmpeg", "-y", "-v", "error", "-i", joined, "-an", "-c:v", "copy", final])
+                    else:
+                        if mode == "song":
+                            songs = await self._chat_media(__metadata__, __chat_id__, __message_id__, "audio/")
+                            if not songs:
+                                return self._error('No music in this chat yet: use soundtrack="new" or generate_music first.')
+                            r = (song_ref or "latest").strip().lower().lstrip("#")
+                            si = len(songs) - 1 if r in ("", "latest", "last") else int(r) - 1 if r.isdigit() else -1
+                            if not 0 <= si < len(songs):
+                                return self._error(f"song_ref {song_ref!r}: this chat has {len(songs)} audio track(s).")
+                            audio = await self._read_file(songs[si]["id"], __user__)
+                        else:
+                            if not (music_style or "").strip():
+                                return self._error('soundtrack="new" needs music_style.')
+                            await self._status(__event_emitter__, f"{label}: composing a {round(total)}s soundtrack")
+                            awf = self._template("ace_step_t2a")
+                            awf[_T2A["encode"]]["inputs"]["tags"] = music_style
+                            awf[_T2A["encode"]]["inputs"]["lyrics"] = "[inst]"
+                            awf[_T2A["latent"]]["inputs"]["seconds"] = max(5, int(total + 1))
+                            awf[_T2A["sampler"]]["inputs"]["seed"] = random.randint(0, 2**32 - 1)
+                            audio = await self._comfy(awf, _T2A["save"], self.valves.AUDIO_TIMEOUT, label, __event_emitter__)
+                        apath = os.path.join(tmp, "music.mp3")
+                        open(apath, "wb").write(audio)
+                        fade = max(0.0, total - 1.5)
+                        await self._ffmpeg(["ffmpeg", "-y", "-v", "error", "-i", joined, "-i", apath, "-map", "0:v", "-map", "1:a",
+                                            "-c:v", "copy", "-af", f"afade=t=out:st={fade:.2f}:d=1.5", "-c:a", "aac",
+                                            "-t", f"{total:.3f}", final])
+                movie = open(final, "rb").read()
+        except ComfyError as e:
+            await self._status(__event_emitter__, f"{label}: failed", done=True)
+            return self._error(str(e))
+        took = round(time.monotonic() - t0, 1)
+        try:
+            new_id = await self._publish("video", movie, "video/mp4", __request__, __user__, __metadata__,
+                                         __chat_id__, __message_id__, __event_emitter__)
+        except Exception as e:
+            return self._error(f"Movie made, but saving to Open WebUI failed: {type(e).__name__}: {e}")
+        await self._status(__event_emitter__, f"{label}: {round(total, 1)}s movie in {took}s", done=True)
+        status = {"status": "success", "seconds_taken": took, "movie_seconds": round(total, 1),
+                  "clips": [i + 1 for i in chosen], "soundtrack": mode,
+                  "message": "The movie player is already visible to the user in the chat. Do not repeat links; "
+                             "briefly describe the finished movie."}
+        return HTMLResponse(content=self._media_embed("video", movie, "video/mp4", mode != "none"),
+                            headers={"Content-Disposition": "inline"}), json.dumps(status)
+
+    # --------------------------------------------------------------- ffmpeg helpers
+
+    @staticmethod
+    async def _ffmpeg(cmd: list, capture: bool = False) -> str:
+        proc = await asyncio.create_subprocess_exec(*cmd, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE)
+        out, err = await proc.communicate()
+        if proc.returncode != 0:
+            raise ComfyError(f"{cmd[0]} failed: {err.decode(errors='replace')[-300:]}")
+        return out.decode()
+
+    async def _probe_size(self, path: str) -> tuple:
+        out = await self._ffmpeg(["ffprobe", "-v", "error", "-select_streams", "v:0", "-show_entries", "stream=width,height",
+                                  "-of", "csv=p=0", path])
+        w, h = out.strip().split(",")[:2]
+        return int(w), int(h)
+
+    async def _has_audio(self, path: str) -> bool:
+        out = await self._ffmpeg(["ffprobe", "-v", "error", "-select_streams", "a", "-show_entries", "stream=index",
+                                  "-of", "csv=p=0", path])
+        return bool(out.strip())
+
+    async def _duration(self, path: str) -> float:
+        out = await self._ffmpeg(["ffprobe", "-v", "error", "-show_entries", "format=duration", "-of", "csv=p=0", path])
+        return float(out.strip())
+
     # --------------------------------------------------------------- helpers
 
     def _template(self, name: str) -> dict:
@@ -405,18 +569,20 @@ class Tools:
             "message": f"{shown} is already visible to the user in the chat. Do not repeat links or "
                        f"markdown for it; just briefly describe what was made.",
         })
+        try:
+            ids = [i["id"] for i in await self._chat_media(metadata, chat_id, message_id, content_type.split("/")[0] + "/")]
+            number = ids.index(new_id) + 1 if new_id in ids else None
+        except Exception:
+            number = None
+        if number:
+            status = json.loads(status_json)
+            status[f"{kind}_number"] = number
+            hint = {"image": f"pass image_ref=\"{number}\" (or character_refs) to edit_image/animate_image to use it later.",
+                    "video": f"make_movie can combine videos by number (video_refs).",
+                    "audio": f"make_movie can use it as the film's soundtrack (soundtrack=\"song\", song_ref=\"{number}\")."}[kind]
+            status["message"] += f" This is {kind} #{number} in the chat; {hint}"
+            status_json = json.dumps(status)
         if kind == "image":
-            try:
-                ids = [i["id"] for i in await self._chat_images(metadata, chat_id, message_id)]
-                number = ids.index(new_id) + 1 if new_id in ids else None
-            except Exception:
-                number = None
-            if number:
-                status = json.loads(status_json)
-                status["image_number"] = number
-                status["message"] += (f" This is image #{number} in the chat; pass image_ref=\"{number}\" to "
-                                      f"edit_image/animate_image to start from it later.")
-                status_json = json.dumps(status)
             return status_json
         # Assistant messages render image files inline but show other files only as a
         # download card (video: not at all), so play audio/video from an inline embed.
@@ -476,7 +642,10 @@ class Tools:
         return item.id
 
     async def _chat_images(self, metadata, chat_id, message_id) -> list:
-        """All images in this chat (user attachments and generated), oldest first, de-duplicated by file id."""
+        return await self._chat_media(metadata, chat_id, message_id, "image/")
+
+    async def _chat_media(self, metadata, chat_id, message_id, prefix="image/") -> list:
+        """All files of one media type in this chat (attachments + generated), oldest first, de-duplicated."""
         per_message = []
         if chat_id:
             try:
@@ -501,11 +670,11 @@ class Tools:
             if not isinstance(f, dict):
                 continue
             ctype = str(f.get("content_type") or ((f.get("file") or {}).get("meta") or {}).get("content_type") or "")
-            if not (f.get("type") == "image" or ctype.startswith("image/")):
+            if not (ctype.startswith(prefix) or (prefix == "image/" and f.get("type") == "image")):
                 continue
             url = str(f.get("url") or "")
             fid = f.get("id") or (f.get("file") or {}).get("id")
-            if not fid and not url.startswith("data:image/"):
+            if not fid and not url.startswith("data:"):
                 m = _FILE_ID_RE.search(url)
                 fid = m.group(1) if m else None
             key = fid or url[:200]
