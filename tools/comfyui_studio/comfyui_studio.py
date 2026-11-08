@@ -380,6 +380,7 @@ class Tools:
         music_style: str = "",
         lyrics: str = "",
         character: str = "",
+        transitions: str = "cut",
         __request__=None,
         __user__: dict = None,
         __metadata__: dict = None,
@@ -412,6 +413,7 @@ class Tools:
         :param music_style: Music style tags for one continuous soundtrack under the whole film. Empty = an instrumental cinematic score.
         :param lyrics: Optional song lyrics for the soundtrack ([verse]/[chorus] markers). Leave empty for instrumental.
         :param character: Deprecated single-character description (use characters instead).
+        :param transitions: "cut" (default: hard cuts) or "crossfade" (a short 0.4 s dissolve between shots: softer, dreamier).
         :return: Status JSON. The film, character sheets and keyframes are already shown to the user in the chat.
         """
         ctx = (__request__, __user__, __metadata__, __chat_id__, __message_id__, __event_emitter__)
@@ -429,6 +431,8 @@ class Tools:
         secs = max(3, min(int(seconds_per_shot or 4), 5))
         style = (style or "").strip() or "cinematic photoreal"
         music = (music_style or "").strip() or "cinematic orchestral score, emotional, strings, piano"
+        fade = 0.4 if str(transitions).strip().lower().startswith("cross") else 0.0
+        shot_secs = secs + fade * (len(plan) - 1) / len(plan)  # each dissolve overlaps two shots
         label = f"Story film: {len(plan)} shots x {secs}s"
         await self._status(__event_emitter__, label)
         t0 = time.monotonic()
@@ -448,15 +452,16 @@ class Tools:
 
             clips, prev_clip = [], None  # 2. shots
             for i, shot in enumerate(plan, start=1):
-                clip, kf_id = await self._render_shot(i, len(plan), shot, prev_clip, cast_list, style, secs, label,
+                clip, kf_id = await self._render_shot(i, len(plan), shot, prev_clip, cast_list, style, shot_secs, label,
                                                       __user__, ctx)
                 shot["keyframe_file"] = kf_id
                 shot["clip_file"] = await self._store_hidden(clip, "video/mp4", f"comfy-shot{i}.mp4", __request__, __user__)
                 clips.append(clip)
                 prev_clip = clip
 
-            movie, total, audio = await self._assemble(clips, "new", None, music, lyrics, label, __event_emitter__)  # 3.
+            movie, total, audio = await self._assemble(clips, "new", None, music, lyrics, label, __event_emitter__, fade)  # 3.
             project = {"version": 2, "style": style, "seconds_per_shot": secs, "music_style": music, "lyrics": lyrics,
+                       "crossfade": fade,
                        "characters": [{k: v for k, v in c.items() if not k.startswith("_")} for c in cast_list],
                        "shots": plan,
                        "soundtrack_file": await self._store_hidden(audio, "audio/mpeg", "comfy-soundtrack.mp3", __request__, __user__)}
@@ -517,6 +522,8 @@ class Tools:
         redo = [k] + [j for j in range(k + 1, len(plan) + 1)
                       if all(plan[x - 1].get("continue") for x in range(k + 1, j + 1))]
         secs, style = project["seconds_per_shot"], project["style"]
+        fade = float(project.get("crossfade") or 0)
+        secs = secs + fade * (len(plan) - 1) / len(plan)
         label = f"Redoing shot {k}" + (f" (+ continuing shot{'s' if len(redo) > 2 else ''} {', '.join(map(str, redo[1:]))})" if len(redo) > 1 else "")
         await self._status(__event_emitter__, label)
         t0 = time.monotonic()
@@ -532,7 +539,8 @@ class Tools:
                 plan[j - 1]["clip_file"] = await self._store_hidden(clip, "video/mp4", f"comfy-shot{j}.mp4", __request__, __user__)
                 clips[j - 1] = clip
             audio = await self._read_file(project["soundtrack_file"], __user__)
-            movie, total, _ = await self._assemble(clips, "song", audio, "", "", label, __event_emitter__)
+            movie, total, _ = await self._assemble(clips, "song", audio, "", "", label, __event_emitter__,
+                                                   float(project.get("crossfade") or 0))
             for c in cast_list:
                 c.pop("_up", None)
         except ComfyError as e:
@@ -692,12 +700,13 @@ class Tools:
         wf[_I2V["prompt"]]["inputs"]["text"] = prompt
         wf[_I2V["latent"]]["inputs"]["width"] = w
         wf[_I2V["latent"]]["inputs"]["height"] = h
-        wf[_I2V["latent"]]["inputs"]["length"] = secs * 16 + 1
+        wf[_I2V["latent"]]["inputs"]["length"] = 4 * max(1, round(secs * 16 / 4)) + 1  # Wan wants 4k+1 frames @16fps
         wf[_I2V["lora"]]["inputs"]["value"] = True
         wf[_I2V["sampler"]]["inputs"]["noise_seed"] = random.randint(0, 2**32 - 1)
         return wf
 
-    async def _assemble(self, clips: list, mode: str, audio, music_style: str, lyrics: str, label: str, emitter) -> tuple:
+    async def _assemble(self, clips: list, mode: str, audio, music_style: str, lyrics: str, label: str, emitter,
+                        crossfade: float = 0.0) -> tuple:
         """Concatenate clip bytes; soundtrack mode clips/song/new/none. Returns (mp4 bytes, seconds, soundtrack bytes or None)."""
         import os
         import tempfile
@@ -728,7 +737,23 @@ class Tools:
             listing = os.path.join(tmp, "list.txt")
             open(listing, "w").write("".join(f"file '{p}'\n" for p in parts))
             joined = os.path.join(tmp, "joined.mp4")
-            await self._ffmpeg(["ffmpeg", "-y", "-v", "error", "-f", "concat", "-safe", "0", "-i", listing, "-c", "copy", joined])
+            if crossfade > 0 and len(parts) > 1:  # dissolve between shots (re-encode, video only; music is added below)
+                durs = [await self._duration(p) for p in parts]
+                ins, chain, prev, acc = [], [], "[0:v]", 0.0
+                for k, p in enumerate(parts):
+                    ins += ["-i", p]
+                for k in range(1, len(parts)):
+                    acc += durs[k - 1] - crossfade
+                    out = f"[x{k}]" if k < len(parts) - 1 else "[vout]"
+                    chain.append(f"{prev}[{k}:v]xfade=transition=fade:duration={crossfade}:offset={acc:.3f}{out}")
+                    prev = out
+                await self._ffmpeg(["ffmpeg", "-y", "-v", "error", *ins, "-filter_complex", ";".join(chain), "-map", "[vout]",
+                                    "-c:v", "libx264", "-preset", "veryfast", "-crf", "18", "-threads", "2",
+                                    "-pix_fmt", "yuv420p", "-an", joined])
+                if mode == "clips":
+                    mode = "none"  # per-clip audio can't follow a dissolve; use song/new for sound
+            else:
+                await self._ffmpeg(["ffmpeg", "-y", "-v", "error", "-f", "concat", "-safe", "0", "-i", listing, "-c", "copy", joined])
             total = await self._duration(joined)
             final = joined
             if mode == "none":
