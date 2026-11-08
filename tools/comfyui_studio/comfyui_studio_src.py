@@ -381,6 +381,7 @@ class Tools:
         lyrics: str = "",
         character: str = "",
         transitions: str = "cut",
+        storyboard_only: bool = False,
         __request__=None,
         __user__: dict = None,
         __metadata__: dict = None,
@@ -392,20 +393,19 @@ class Tools:
         Make a complete short film (about 15-30 s) from a story: several shots of 3-5 s each, the same characters
         throughout, and one continuous soundtrack. Use this whenever the user wants a story video, short film or anything
         longer than one clip. Takes about 1-1.5 minutes per shot. Afterwards, single shots can be changed with redo_shot.
-
-        How it works: one clean reference sheet per character is made first; every shot's keyframe is an edit that places
-        exactly that shot's cast (from their sheets) into the shot's scene, then each keyframe is animated.
+        With storyboard_only=true it stops after the character sheets and keyframes (~15 s per shot) so the user can review
+        and fix them (redo_shot) before animate_storyboard turns them into the film.
 
         :param shots: JSON array of 4-8 shots in story order, e.g.
-            [{"scene": "the robot stands alone in a rainy neon alley at night, wide shot", "action": "rain falls, the robot slowly looks around", "cast": ["robot"]},
-             {"scene": "close-up: the robot crouches and reaches toward the kitten", "action": "...", "cast": ["robot", "kitten"], "continue": true}].
+            [{"scene": "wide shot: the robot stands alone in a rainy neon alley at night", "action": "rain falls, slow push-in", "expression": "lonely, wistful", "cast": ["robot"]},
+             {"scene": "close-up: the robot crouches and reaches toward the kitten", "action": "...", "expression": "the kitten frightened, the robot gentle", "cast": ["robot", "kitten"], "continue": true}].
             "scene" = what the keyframe shows (setting, pose, framing/shot size, lighting); "action" = the motion and camera
-            movement during the shot; "cast" = names (from characters) that appear in this shot, max 3, [] for none.
-            "continue": true = this shot follows straight on from the previous one in the same place: it starts from the
-            previous shot's last frame (with "scene" given, that frame is re-framed/changed as described).
-        :param characters: JSON array of the recurring characters, each described separately and in fixed, specific
-            detail (body, colors, materials, face/eyes, clothing, size), e.g.
-            [{"name": "robot", "description": "a small knee-high robot with a polished brass body, dome head, two round glowing blue eyes, thin antenna"},
+            movement; "expression" = the characters' emotions/facial expressions in this shot; "cast" = names (from characters)
+            visible in this shot, max 3, [] for none. "continue": true = follows straight on from the previous shot in the same
+            place (starts from its last frame; with "scene" given, re-framed/changed as described).
+        :param characters: JSON array of the recurring characters (people, animals, or important objects like a car), each
+            described separately and in fixed, specific detail (body, colors, materials, face/eyes, clothing, size), e.g.
+            [{"name": "robot", "description": "a small knee-high robot with a polished brass body, dome head, two round glowing blue eyes"},
              {"name": "kitten", "description": "a tiny fluffy grey-and-white kitten with green eyes"}].
             Optional per character: "image_ref" = an image number already in the chat to use as that character's sheet.
         :param style: One visual style for the whole film, repeated in every prompt. Default "cinematic photoreal, soft natural lighting, shallow depth of field".
@@ -414,7 +414,9 @@ class Tools:
         :param lyrics: Optional song lyrics for the soundtrack ([verse]/[chorus] markers). Leave empty for instrumental.
         :param character: Deprecated single-character description (use characters instead).
         :param transitions: "cut" (default: hard cuts) or "crossfade" (a short 0.4 s dissolve between shots: softer, dreamier).
-        :return: Status JSON. The film, character sheets and keyframes are already shown to the user in the chat.
+        :param storyboard_only: true = only make the character sheets + keyframes for review (no animation yet). Use it when
+            the user wants to see/approve a storyboard first.
+        :return: Status JSON. The film (or storyboard), character sheets and keyframes are already shown to the user.
         """
         ctx = (__request__, __user__, __metadata__, __chat_id__, __message_id__, __event_emitter__)
         try:
@@ -429,43 +431,26 @@ class Tools:
             shot["cast"] = [c for c in shot.get("cast", names) if c in names][:3]
         plan[0]["continue"] = False
         secs = max(3, min(int(seconds_per_shot or 4), 5))
+        fade = 0.4 if str(transitions).strip().lower().startswith("cross") else 0.0
         style = (style or "").strip() or "cinematic photoreal"
         music = (music_style or "").strip() or "cinematic orchestral score, emotional, strings, piano"
-        fade = 0.4 if str(transitions).strip().lower().startswith("cross") else 0.0
-        shot_secs = secs + fade * (len(plan) - 1) / len(plan)  # each dissolve overlaps two shots
-        label = f"Story film: {len(plan)} shots x {secs}s"
+        sb = str(storyboard_only).strip().lower() in ("true", "1", "yes")
+        label = f"Story {'storyboard' if sb else 'film'}: {len(plan)} shots" + ("" if sb else f" x {secs}s")
         await self._status(__event_emitter__, label)
         t0 = time.monotonic()
         try:
-            for c in cast_list:  # 1. one reference sheet per character
-                if c.get("image_ref"):
-                    data, _ = await self._pick_image(__user__, __metadata__, __chat_id__, __message_id__, str(c["image_ref"]))
-                else:
-                    await self._status(__event_emitter__, f"{label}: {c['name']} reference sheet")
-                    w, h = _IMAGE_SIZES["landscape"]
-                    data = await self._comfy(self._t2i_wf(
-                        f"Character reference image: {c['description']}. Only this one character, full body, standing in a "
-                        f"relaxed natural three-quarter view, neutral expression, clearly visible, plain simple neutral "
-                        f"background. {style}.", w, h),
-                        _IMG["save"], self.valves.IMAGE_TIMEOUT, f"{label}: {c['name']} sheet", __event_emitter__)
-                c["sheet_file"] = await self._publish("image", data, "image/png", *ctx)
-                c["_up"] = await self._upload(data)
-
-            clips, prev_clip = [], None  # 2. shots
-            for i, shot in enumerate(plan, start=1):
-                clip, kf_id = await self._render_shot(i, len(plan), shot, prev_clip, cast_list, style, shot_secs, label,
-                                                      __user__, ctx)
-                shot["keyframe_file"] = kf_id
-                shot["clip_file"] = await self._store_hidden(clip, "video/mp4", f"comfy-shot{i}.mp4", __request__, __user__)
-                clips.append(clip)
-                prev_clip = clip
-
-            movie, total, audio = await self._assemble(clips, "new", None, music, lyrics, label, __event_emitter__, fade)  # 3.
-            project = {"version": 2, "style": style, "seconds_per_shot": secs, "music_style": music, "lyrics": lyrics,
-                       "crossfade": fade,
-                       "characters": [{k: v for k, v in c.items() if not k.startswith("_")} for c in cast_list],
-                       "shots": plan,
-                       "soundtrack_file": await self._store_hidden(audio, "audio/mpeg", "comfy-soundtrack.mp3", __request__, __user__)}
+            await self._make_sheets(cast_list, style, label, ctx)
+            project = {"version": 3, "status": "storyboard", "style": style, "seconds_per_shot": secs, "crossfade": fade,
+                       "music_style": music, "lyrics": lyrics, "characters": cast_list, "shots": plan}
+            if sb:
+                prev_kf = None
+                for i, shot in enumerate(plan, start=1):
+                    kf, kf_id = await self._shot_keyframe(i, len(plan), shot, prev_kf if shot.get("continue") else None,
+                                                          cast_list, style, label, ctx)
+                    shot["keyframe_file"] = kf_id
+                    prev_kf = kf or prev_kf
+                return await self._finish_storyboard(project, time.monotonic() - t0, label, ctx)
+            movie, total = await self._animate_project(project, label, ctx, use_keyframes=False)
         except ComfyError as e:
             await self._status(__event_emitter__, f"{label}: failed", done=True)
             return self._error(str(e))
@@ -473,11 +458,50 @@ class Tools:
                                        [{"shot": i, "cast": s["cast"], "start": "continues" if s.get("continue") else "new keyframe"}
                                         for i, s in enumerate(plan, start=1)])
 
+    async def animate_storyboard(
+        self,
+        film_ref: str = "latest",
+        __request__=None,
+        __user__: dict = None,
+        __metadata__: dict = None,
+        __chat_id__: str = None,
+        __message_id__: str = None,
+        __event_emitter__: Callable[[dict], Any] = None,
+    ) -> Any:
+        """
+        Turn an approved storyboard (made with make_story_film storyboard_only=true) into the finished film: animates every
+        keyframe as shown, adds the continuous soundtrack. Takes about 1 minute per shot. Use when the user approves the
+        storyboard ("looks good, animate it").
+
+        :param film_ref: Which storyboard: "latest" (default) or a film number.
+        :return: Status JSON. The film is already shown to the user in the chat.
+        """
+        ctx = (__request__, __user__, __metadata__, __chat_id__, __message_id__, __event_emitter__)
+        try:
+            project = await self._load_project(film_ref, __metadata__, __chat_id__, __message_id__, __user__)
+        except ComfyError as e:
+            return self._error(str(e))
+        if project.get("status") != "storyboard":
+            return self._error("That one is already a film. Use redo_shot to change shots, or make_story_film for a new one.")
+        label = f"Animating storyboard: {len(project['shots'])} shots x {project['seconds_per_shot']}s"
+        await self._status(__event_emitter__, label)
+        t0 = time.monotonic()
+        try:
+            await self._upload_sheets(project["characters"], __user__)
+            movie, total = await self._animate_project(project, label, ctx, use_keyframes=True)
+        except ComfyError as e:
+            await self._status(__event_emitter__, f"{label}: failed", done=True)
+            return self._error(str(e))
+        return await self._finish_film(movie, total, project, time.monotonic() - t0, label, ctx,
+                                       [{"shot": i, "start": "storyboard keyframe" if s.get("keyframe_file") else "continues"}
+                                        for i, s in enumerate(project["shots"], start=1)])
+
     async def redo_shot(
         self,
         shot: int,
         scene: str = "",
         action: str = "",
+        expression: str = "",
         cast: str = "",
         film_ref: str = "latest",
         __request__=None,
@@ -488,67 +512,72 @@ class Tools:
         __event_emitter__: Callable[[dict], Any] = None,
     ) -> Any:
         """
-        Regenerate one shot of a film made with make_story_film (and any following "continue" shots that depend on it),
-        then rebuild the film with the same soundtrack. Much faster than remaking the whole film (~1-2 min).
-        Use when the user wants to change or fix a specific shot ("redo shot 3", "make the last shot zoom out more").
+        Change one shot of a storyboard or film made with make_story_film. On a storyboard it redraws just that keyframe
+        (~15 s). On a finished film it regenerates the shot (and any following "continue" shots that depend on it) and
+        rebuilds the film with the same soundtrack (~1-2 min). Use for "redo shot 3", "make the last shot zoom out more".
 
         :param shot: Shot number to redo (1 = first shot).
         :param scene: New keyframe description for the shot. Empty = keep the current one (just re-roll).
         :param action: New motion/camera description for the shot. Empty = keep the current one.
+        :param expression: New emotions/facial expressions for the shot (e.g. "tense, Clyde shouting, the teller terrified"). Empty = keep.
         :param cast: Comma-separated character names in the shot (e.g. "robot" or "robot, kitten"). Empty = keep.
-        :param film_ref: Which film: "latest" (default) or a film number.
-        :return: Status JSON. The updated film is already shown to the user in the chat.
+        :param film_ref: Which storyboard/film: "latest" (default) or a film number.
+        :return: Status JSON. The updated storyboard keyframe or film is already shown to the user in the chat.
         """
         ctx = (__request__, __user__, __metadata__, __chat_id__, __message_id__, __event_emitter__)
-        projects = [p for p in await self._chat_media(__metadata__, __chat_id__, __message_id__, "application/json")
-                    if str(p.get("name", "")).startswith("comfy-film")]
-        if not projects:
-            return self._error("No film made with make_story_film in this chat yet.")
-        r = str(film_ref or "latest").strip().lower().lstrip("#")
-        idx = len(projects) - 1 if r in ("", "latest", "last") else int(r) - 1 if r.isdigit() else -1
-        if not 0 <= idx < len(projects):
-            return self._error(f"film_ref {film_ref!r}: this chat has {len(projects)} film(s).")
-        project = json.loads((await self._read_file(projects[idx]["id"], __user__)).decode())
+        try:
+            project = await self._load_project(film_ref, __metadata__, __chat_id__, __message_id__, __user__)
+        except ComfyError as e:
+            return self._error(str(e))
         plan, cast_list = project["shots"], project["characters"]
         k = int(shot or 0)
         if not 1 <= k <= len(plan):
             return self._error(f"shot must be 1-{len(plan)}.")
-        if scene.strip():
-            plan[k - 1]["scene"] = scene.strip()
-        if action.strip():
-            plan[k - 1]["action"] = action.strip()
-        if cast.strip():
+        for key, val in (("scene", scene), ("action", action), ("expression", expression)):
+            if (val or "").strip():
+                plan[k - 1][key] = val.strip()
+        if (cast or "").strip():
             names = [c["name"] for c in cast_list]
             plan[k - 1]["cast"] = [n.strip() for n in cast.split(",") if n.strip() in names][:3]
-        redo = [k] + [j for j in range(k + 1, len(plan) + 1)
-                      if all(plan[x - 1].get("continue") for x in range(k + 1, j + 1))]
-        secs, style = project["seconds_per_shot"], project["style"]
-        fade = float(project.get("crossfade") or 0)
-        secs = secs + fade * (len(plan) - 1) / len(plan)
-        label = f"Redoing shot {k}" + (f" (+ continuing shot{'s' if len(redo) > 2 else ''} {', '.join(map(str, redo[1:]))})" if len(redo) > 1 else "")
-        await self._status(__event_emitter__, label)
+        style = project["style"]
+        label = f"Redoing shot {k}"
         t0 = time.monotonic()
         try:
-            for c in cast_list:
-                c["_up"] = await self._upload(await self._read_file(c["sheet_file"], __user__))
+            await self._upload_sheets(cast_list, __user__)
+            if project.get("status") == "storyboard":
+                label = f"Redrawing storyboard shot {k}"
+                await self._status(__event_emitter__, label)
+                prev_kf = None
+                if plan[k - 1].get("continue"):
+                    for j in range(k - 1, 0, -1):
+                        if plan[j - 1].get("keyframe_file"):
+                            prev_kf = await self._read_file(plan[j - 1]["keyframe_file"], __user__)
+                            break
+                kf, kf_id = await self._shot_keyframe(k, len(plan), plan[k - 1], prev_kf, cast_list, style, label, ctx)
+                if kf_id:
+                    plan[k - 1]["keyframe_file"] = kf_id
+                return await self._finish_storyboard(project, time.monotonic() - t0, label, ctx)
+            redo = [k] + [j for j in range(k + 1, len(plan) + 1)
+                          if all(plan[x - 1].get("continue") for x in range(k + 1, j + 1))]
+            label = f"Redoing shot {k}" + (f" (+ continuing shot{'s' if len(redo) > 2 else ''} {', '.join(map(str, redo[1:]))})" if len(redo) > 1 else "")
+            await self._status(__event_emitter__, label)
+            secs = self._shot_secs(project)
             clips = [await self._read_file(s["clip_file"], __user__) for s in plan]
             for j in redo:
                 prev = clips[j - 2] if j > 1 else None
-                clip, kf_id = await self._render_shot(j, len(plan), plan[j - 1], prev, cast_list, style, secs, label,
-                                                      __user__, ctx)
+                start, kf_id = await self._shot_start(j, len(plan), plan[j - 1], prev, cast_list, style, label, ctx,
+                                                      use_keyframe=False)
                 plan[j - 1]["keyframe_file"] = kf_id
+                clip = await self._animate_shot(j, len(plan), plan[j - 1], start, cast_list, style, secs, label, ctx)
                 plan[j - 1]["clip_file"] = await self._store_hidden(clip, "video/mp4", f"comfy-shot{j}.mp4", __request__, __user__)
                 clips[j - 1] = clip
             audio = await self._read_file(project["soundtrack_file"], __user__)
             movie, total, _ = await self._assemble(clips, "song", audio, "", "", label, __event_emitter__,
                                                    float(project.get("crossfade") or 0))
-            for c in cast_list:
-                c.pop("_up", None)
         except ComfyError as e:
             await self._status(__event_emitter__, f"{label}: failed", done=True)
             return self._error(str(e))
-        return await self._finish_film(movie, total, project, time.monotonic() - t0, label, ctx,
-                                       [{"redone_shots": redo}])
+        return await self._finish_film(movie, total, project, time.monotonic() - t0, label, ctx, [{"redone_shots": redo}])
 
     # --------------------------------------------------------------- story film internals
 
@@ -592,69 +621,165 @@ class Tools:
             c["description"] = str(c["description"]).strip()
         return cl
 
-    async def _render_shot(self, i, n, shot, prev_clip, cast_list, style, secs, label, user, ctx) -> tuple:
-        """Make one shot: keyframe (edit of the cast's sheets, or of the previous last frame) -> i2v clip."""
+    @staticmethod
+    def _shot_secs(project) -> float:
+        n = len(project["shots"])
+        fade = float(project.get("crossfade") or 0)
+        return project["seconds_per_shot"] + fade * (n - 1) / n  # each dissolve overlaps two shots
+
+    async def _make_sheets(self, cast_list, style, label, ctx):
+        request, user, metadata, chat_id, message_id, emitter = ctx
+        for c in cast_list:
+            if c.get("image_ref"):
+                data, _ = await self._pick_image(user, metadata, chat_id, message_id, str(c["image_ref"]))
+            else:
+                await self._status(emitter, f"{label}: {c['name']} reference sheet")
+                w, h = _IMAGE_SIZES["landscape"]
+                data = await self._comfy(self._t2i_wf(
+                    f"Character reference image: {c['description']}. Only this one character, full body, standing in a "
+                    f"relaxed natural three-quarter view, neutral expression, clearly visible, plain simple neutral "
+                    f"background. {style}.", w, h),
+                    _IMG["save"], self.valves.IMAGE_TIMEOUT, f"{label}: {c['name']} sheet", emitter)
+            c["sheet_file"] = await self._publish("image", data, "image/png", *ctx)
+            c["_up"] = await self._upload(data)
+
+    async def _upload_sheets(self, cast_list, user):
+        for c in cast_list:
+            c["_up"] = await self._upload(await self._read_file(c["sheet_file"], user))
+
+    async def _load_project(self, film_ref, metadata, chat_id, message_id, user) -> dict:
+        projects = [p for p in await self._chat_media(metadata, chat_id, message_id, "application/json")
+                    if str(p.get("name", "")).startswith("comfy-film")]
+        if not projects:
+            raise ComfyError("No storyboard or film made with make_story_film in this chat yet.")
+        r = str(film_ref or "latest").strip().lower().lstrip("#")
+        idx = len(projects) - 1 if r in ("", "latest", "last") else int(r) - 1 if r.isdigit() else -1
+        if not 0 <= idx < len(projects):
+            raise ComfyError(f"film_ref {film_ref!r}: this chat has {len(projects)} storyboard/film version(s).")
+        return json.loads((await self._read_file(projects[idx]["id"], user)).decode())
+
+    async def _last_frame(self, clip: bytes) -> bytes:
         import os
         import tempfile
 
+        with tempfile.TemporaryDirectory() as tmp:
+            p = os.path.join(tmp, "prev.mp4"); open(p, "wb").write(clip)
+            f = os.path.join(tmp, "last.png")
+            await self._ffmpeg(["ffmpeg", "-y", "-v", "error", "-sseof", "-0.15", "-i", p, "-frames:v", "1", "-update", "1", f])
+            return open(f, "rb").read()
+
+    def _prompt_bits(self, shot, cast_list):
         by_name = {c["name"]: c for c in cast_list}
         cast = [by_name[c] for c in shot.get("cast", []) if c in by_name][:3]
-        scene = str(shot.get("scene") or "").strip()
-        action = str(shot.get("action") or scene or "subtle natural movement").strip()
-        cont = bool(shot.get("continue")) and prev_clip is not None
-        tag = f"{label}: shot {i}/{n}"
         who = "; ".join(f"the {c['name']} is {c['description']}" for c in cast)
+        expr = str(shot.get("expression") or "").strip()
         lock = ("Each character keeps exactly its own design, colors, materials and proportions; colored lights, "
                 "reflections and props must not change any character's colors.")
         candid = ("This is a candid frame from a film, not a portrait: the characters are caught mid-action, in the poses "
                   "and with the expressions the scene calls for, looking at each other or at what is happening, never "
                   "at the camera and never posing or smiling for the camera.")
-        kf_id = None
-        if cont:
-            with tempfile.TemporaryDirectory() as tmp:
-                p = os.path.join(tmp, "prev.mp4"); open(p, "wb").write(prev_clip)
-                f = os.path.join(tmp, "last.png")
-                await self._ffmpeg(["ffmpeg", "-y", "-v", "error", "-sseof", "-0.15", "-i", p, "-frames:v", "1", "-update", "1", f])
-                start = open(f, "rb").read()
-            if scene:  # continuous, but re-framed / changed as described
-                await self._status(ctx[5], f"{tag}: keyframe (continuing)")
-                refs = [c["_up"] for c in cast][:2]
-                pics = "".join(f" The {c['name']} must look exactly like the one in Picture {k + 2}." for k, c in enumerate(cast[:2]))
-                start = await self._comfy(self._edit_wf(await self._upload(start),
-                    f"Continue this exact moment from Picture 1 (same place, same characters, same lighting): {scene}.{pics} "
-                    f"{who + '. ' if who else ''}{candid} {lock} Style: {style}.", refs),
-                    _EDIT["save"], self.valves.IMAGE_TIMEOUT, f"{tag}: keyframe", ctx[5])
-                kf_id = await self._publish("image", start, "image/png", *ctx)
+        feel = f"Facial expressions and mood: {expr}." if expr else ""
+        return cast, who, lock, candid, feel
+
+    async def _shot_keyframe(self, i, n, shot, base, cast_list, style, label, ctx) -> tuple:
+        """Keyframe for one shot -> (png bytes or None, published file id or None).
+
+        base = image to continue from (previous clip's last frame, or in a storyboard the previous keyframe) for
+        "continue" shots; a continue shot without its own scene has no keyframe of its own (returns None, None)."""
+        emitter = ctx[5]
+        cast, who, lock, candid, feel = self._prompt_bits(shot, cast_list)
+        scene = str(shot.get("scene") or "").strip()
+        tag = f"{label}: shot {i}/{n}"
+        if shot.get("continue") and base is not None:
+            if not scene:
+                return None, None
+            await self._status(emitter, f"{tag}: keyframe (continuing)")
+            pics = "".join(f" The {c['name']} must look exactly like the one in Picture {k + 2}." for k, c in enumerate(cast[:2]))
+            img = await self._comfy(self._edit_wf(await self._upload(base),
+                f"Continue this exact moment from Picture 1 (same place, same characters, same lighting): {scene}.{pics} "
+                f"{who + '. ' if who else ''}{feel} {candid} {lock} Style: {style}.", [c["_up"] for c in cast][:2]),
+                _EDIT["save"], self.valves.IMAGE_TIMEOUT, f"{tag}: keyframe", emitter)
         elif cast:
-            await self._status(ctx[5], f"{tag}: keyframe")
+            await self._status(emitter, f"{tag}: keyframe")
             pics = " and ".join(f"the {c['name']} from Picture {k + 1}" for k, c in enumerate(cast))
-            only = "No other characters appear." if len(cast) else ""
-            start = await self._comfy(self._edit_wf(cast[0]["_up"],
+            img = await self._comfy(self._edit_wf(cast[0]["_up"],
                 f"Create a new image showing {pics} in this scene: {scene}. {who}. Keep every character exactly as in its "
-                f"picture, but in the pose the scene describes. Replace the whole background with the scene. {only} "
-                f"{candid} {lock} Style: {style}.",
-                [c["_up"] for c in cast[1:]]),
-                _EDIT["save"], self.valves.IMAGE_TIMEOUT, f"{tag}: keyframe", ctx[5])
-            kf_id = await self._publish("image", start, "image/png", *ctx)
-        else:  # no recurring character in this shot (establishing shot, landscape, ...)
-            await self._status(ctx[5], f"{tag}: keyframe")
+                f"picture, but in the pose the scene describes. {feel} Replace the whole background with the scene. "
+                f"No other recurring characters appear. {candid} {lock} Style: {style}.", [c["_up"] for c in cast[1:]]),
+                _EDIT["save"], self.valves.IMAGE_TIMEOUT, f"{tag}: keyframe", emitter)
+        else:  # no recurring character (establishing shot, landscape, ...)
+            await self._status(emitter, f"{tag}: keyframe")
             w, h = _IMAGE_SIZES["landscape"]
-            start = await self._comfy(self._t2i_wf(f"{scene}. {style}.", w, h), _IMG["save"], self.valves.IMAGE_TIMEOUT,
-                                      f"{tag}: keyframe", ctx[5])
-            kf_id = await self._publish("image", start, "image/png", *ctx)
+            img = await self._comfy(self._t2i_wf(f"{scene}. {feel} {style}.", w, h), _IMG["save"],
+                                    self.valves.IMAGE_TIMEOUT, f"{tag}: keyframe", emitter)
+        return img, await self._publish("image", img, "image/png", *ctx)
+
+    async def _shot_start(self, i, n, shot, prev_clip, cast_list, style, label, ctx, use_keyframe) -> tuple:
+        """Start frame for animating a shot -> (png bytes, keyframe file id or None)."""
+        if use_keyframe and shot.get("keyframe_file"):
+            return await self._read_file(shot["keyframe_file"], ctx[1]), shot["keyframe_file"]
+        base = await self._last_frame(prev_clip) if shot.get("continue") and prev_clip is not None else None
+        img, kf_id = await self._shot_keyframe(i, n, shot, base, cast_list, style, label, ctx)
+        return (img if img is not None else base), kf_id
+
+    async def _animate_shot(self, i, n, shot, start, cast_list, style, secs, label, ctx) -> bytes:
+        cast, who, lock, candid, feel = self._prompt_bits(shot, cast_list)
+        action = str(shot.get("action") or shot.get("scene") or "subtle natural movement").strip()
         w, h = self._video_size_for(start)
+        tag = f"{label}: shot {i}/{n}"
         await self._status(ctx[5], f"{tag}: animating")
-        clip = await self._comfy(self._i2v_wf(await self._upload(start),
-            f"{action}. {who + '. ' if who else ''}The characters act naturally and never look at the camera. {lock} "
-            f"{style}. Smooth, natural, clearly visible motion.", w, h, secs),
+        return await self._comfy(self._i2v_wf(await self._upload(start),
+            f"{action}. {who + '. ' if who else ''}{feel} The characters act naturally and never look at the camera. "
+            f"Only the people, animals and objects already in the first frame appear: nobody new enters or appears in the "
+            f"foreground. {lock} {style}. Smooth, natural, clearly visible motion.", w, h, secs),
             _I2V["save"], self.valves.VIDEO_TIMEOUT, f"{tag}: animating", ctx[5])
-        return clip, kf_id
+
+    async def _animate_project(self, project, label, ctx, use_keyframes) -> tuple:
+        """Animate every shot of a project (making keyframes unless use_keyframes) + soundtrack. Updates project."""
+        request, user = ctx[0], ctx[1]
+        plan, cast_list, style = project["shots"], project["characters"], project["style"]
+        secs = self._shot_secs(project)
+        clips, prev = [], None
+        for i, shot in enumerate(plan, start=1):
+            start, kf_id = await self._shot_start(i, len(plan), shot, prev, cast_list, style, label, ctx, use_keyframes)
+            shot["keyframe_file"] = kf_id
+            clip = await self._animate_shot(i, len(plan), shot, start, cast_list, style, secs, label, ctx)
+            shot["clip_file"] = await self._store_hidden(clip, "video/mp4", f"comfy-shot{i}.mp4", request, user)
+            clips.append(clip)
+            prev = clip
+        movie, total, audio = await self._assemble(clips, "new", None, project["music_style"], project.get("lyrics", ""),
+                                                   label, ctx[5], float(project.get("crossfade") or 0))
+        project["soundtrack_file"] = await self._store_hidden(audio, "audio/mpeg", "comfy-soundtrack.mp3", request, user)
+        project["status"] = "film"
+        return movie, total
+
+    def _clean_project(self, project) -> bytes:
+        p = json.loads(json.dumps(project, default=str))
+        for c in p.get("characters", []):
+            c.pop("_up", None)
+        return json.dumps(p, indent=1).encode()
+
+    async def _finish_storyboard(self, project, took, label, ctx) -> Any:
+        request, user, metadata, chat_id, message_id, emitter = ctx
+        try:
+            await self._publish("film", self._clean_project(project), "application/json", *ctx)
+        except Exception as e:
+            return self._error(f"Storyboard made, but saving to Open WebUI failed: {type(e).__name__}: {e}")
+        await self._status(emitter, f"{label}: done in {round(took)}s", done=True)
+        shots = [{"shot": i, "keyframe": bool(s.get("keyframe_file")), "cast": s.get("cast"),
+                  "note": "" if s.get("keyframe_file") else "continues from the previous shot (no keyframe of its own)"}
+                 for i, s in enumerate(project["shots"], start=1)]
+        return json.dumps({"status": "success", "storyboard": True, "seconds_taken": round(took), "shots": shots,
+                           "message": "The storyboard (character sheets + one keyframe per shot) is already visible to the "
+                                      "user. Do not repeat links. List the shots briefly by number and ask the user to "
+                                      "approve or request changes. Changes: redo_shot(shot=N, scene/expression/cast...). "
+                                      "When approved: animate_storyboard()."})
 
     async def _finish_film(self, movie, total, project, took, label, ctx, report) -> Any:
         request, user, metadata, chat_id, message_id, emitter = ctx
         try:
             await self._publish("video", movie, "video/mp4", *ctx)
-            await self._publish("film", json.dumps(project, indent=1).encode(), "application/json", *ctx)
+            await self._publish("film", self._clean_project(project), "application/json", *ctx)
             films = [p for p in await self._chat_media(metadata, chat_id, message_id, "application/json")
                      if str(p.get("name", "")).startswith("comfy-film")]
         except Exception as e:

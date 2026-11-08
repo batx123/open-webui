@@ -12,7 +12,8 @@ soundtrack) and music to Open WebUI chats, using a local ComfyUI server.
 | `generate_music` | ACE-Step 3.5B | ~10 s per 15 s |
 | `make_movie` | ffmpeg (in the Open WebUI pod) | seconds |
 | `make_story_film` | all of the above: one sheet per character → per-shot keyframe edits (that shot's cast) → i2v → one soundtrack | ~1-1.5 min per shot (20 s film ≈ 6 min) |
-| `redo_shot` | regenerates one shot (+ dependent `continue` shots), rebuilds the film with the same soundtrack | ~1-2 min |
+| `redo_shot` | on a film: regenerates one shot (+ dependent `continue` shots) and rebuilds with the same soundtrack (~1-2 min); on a storyboard: redraws one keyframe (~15 s) | |
+| `animate_storyboard` | turns an approved storyboard (`make_story_film(storyboard_only=true)`) into the film | ~1 min per shot |
 
 `generate_video` and `animate_image` take an optional `music_style`. When it's set, the
 ACE-Step graph is merged into the video graph and wired into `CreateVideo`'s audio input, so
@@ -46,3 +47,7 @@ re-framed if it has its own `scene`). Each film saves a `comfy-film-*.json` proj
 in the chat, which `redo_shot` uses to replace one shot without touching the others. Uniform
 clips are joined with a stream copy (no re-encode, ~55 MB peak), and one ACE-Step soundtrack covers the whole film.
 Give the Open WebUI container a 4Gi memory limit: at 2Gi it was OOM-killed during a film (it idles at ~1Gi).
+
+Storyboard-first: `make_story_film(storyboard_only=true)` makes only the character sheets and keyframes (~2.5 min for
+6 shots) for review; `redo_shot` redraws single keyframes; `animate_storyboard` animates exactly the approved frames.
+Each shot can carry an `expression` (emotions), which goes into both the keyframe and the motion prompt.
