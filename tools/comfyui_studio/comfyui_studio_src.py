@@ -307,8 +307,9 @@ class Tools:
         __event_emitter__: Callable[[dict], Any] = None,
     ) -> Any:
         """
-        Combine video clips from this chat into one movie (in order), e.g. to finish a story. Runs ffmpeg; no new
-        video is generated, so it takes seconds (a new soundtrack adds ~10-20 s).
+        Combine video clips already in this chat into one movie (in order). Runs ffmpeg; no new video is
+        generated, so it takes seconds (a new soundtrack adds ~10-20 s). To make a whole new multi-shot film
+        from a story, use make_story_film instead.
 
         :param video_refs: "all" (default: every video in the chat, oldest first) or video numbers in the order to use, e.g. "1,2,3".
         :param soundtrack: "clips" (default: keep each clip's own audio), "song" (use a music track already made in this chat, see song_ref),
@@ -317,9 +318,6 @@ class Tools:
         :param music_style: For soundtrack="new": music style tags, e.g. "warm hopeful orchestral, strings, piano".
         :return: Status JSON. The movie is already shown to the user in the chat.
         """
-        import os
-        import tempfile
-
         videos = await self._chat_media(__metadata__, __chat_id__, __message_id__, "video/")
         if not videos:
             return self._error("There are no videos in this chat yet.")
@@ -328,8 +326,7 @@ class Tools:
             chosen = list(range(len(videos)))
         else:
             chosen = [int(n) - 1 for n in re.split(r"[^0-9]+", ref) if n]
-            bad = [i + 1 for i in chosen if not 0 <= i < len(videos)]
-            if bad or not chosen:
+            if not chosen or any(not 0 <= i < len(videos) for i in chosen):
                 return self._error(f"video_refs {video_refs!r}: this chat has {len(videos)} video(s), numbered 1-{len(videos)}.")
         mode = (soundtrack or "clips").strip().lower()
         if mode not in ("clips", "song", "new", "none"):
@@ -338,73 +335,32 @@ class Tools:
         await self._status(__event_emitter__, label)
         t0 = time.monotonic()
         try:
-            with tempfile.TemporaryDirectory() as tmp:
-                clips = []
-                for k, i in enumerate(chosen):
-                    data = await self._read_file(videos[i]["id"], __user__) if videos[i]["id"] else None
-                    if not data:
-                        return self._error(f"Could not read video #{i + 1}.")
-                    path = os.path.join(tmp, f"clip{k}.mp4")
-                    open(path, "wb").write(data)
-                    clips.append(path)
-                w, h = await self._probe_size(clips[0])
-                parts = []
-                for k, c in enumerate(clips):  # normalise size/fps, give every clip an audio track
-                    out = os.path.join(tmp, f"norm{k}.mp4")
-                    has_audio = await self._has_audio(c)
-                    cmd = ["ffmpeg", "-y", "-v", "error", "-i", c]
-                    if not has_audio:
-                        cmd += ["-f", "lavfi", "-i", "anullsrc=r=44100:cl=stereo"]
-                    cmd += ["-vf", f"scale={w}:{h}:force_original_aspect_ratio=decrease,pad={w}:{h}:(ow-iw)/2:(oh-ih)/2,fps=16,format=yuv420p",
-                            "-c:v", "libx264", "-preset", "veryfast", "-crf", "18", "-c:a", "aac", "-ar", "44100", "-ac", "2"]
-                    if not has_audio:
-                        cmd += ["-shortest"]
-                    await self._ffmpeg(cmd + [out])
-                    parts.append(out)
-                listing = os.path.join(tmp, "list.txt")
-                open(listing, "w").write("".join(f"file '{p}'\n" for p in parts))
-                joined = os.path.join(tmp, "joined.mp4")
-                await self._ffmpeg(["ffmpeg", "-y", "-v", "error", "-f", "concat", "-safe", "0", "-i", listing, "-c", "copy", joined])
-                total = await self._duration(joined)
-                final = joined
-                if mode in ("song", "new", "none"):
-                    final = os.path.join(tmp, "final.mp4")
-                    if mode == "none":
-                        await self._ffmpeg(["ffmpeg", "-y", "-v", "error", "-i", joined, "-an", "-c:v", "copy", final])
-                    else:
-                        if mode == "song":
-                            songs = await self._chat_media(__metadata__, __chat_id__, __message_id__, "audio/")
-                            if not songs:
-                                return self._error('No music in this chat yet: use soundtrack="new" or generate_music first.')
-                            r = (song_ref or "latest").strip().lower().lstrip("#")
-                            si = len(songs) - 1 if r in ("", "latest", "last") else int(r) - 1 if r.isdigit() else -1
-                            if not 0 <= si < len(songs):
-                                return self._error(f"song_ref {song_ref!r}: this chat has {len(songs)} audio track(s).")
-                            audio = await self._read_file(songs[si]["id"], __user__)
-                        else:
-                            if not (music_style or "").strip():
-                                return self._error('soundtrack="new" needs music_style.')
-                            await self._status(__event_emitter__, f"{label}: composing a {round(total)}s soundtrack")
-                            awf = self._template("ace_step_t2a")
-                            awf[_T2A["encode"]]["inputs"]["tags"] = music_style
-                            awf[_T2A["encode"]]["inputs"]["lyrics"] = "[inst]"
-                            awf[_T2A["latent"]]["inputs"]["seconds"] = max(5, int(total + 1))
-                            awf[_T2A["sampler"]]["inputs"]["seed"] = random.randint(0, 2**32 - 1)
-                            audio = await self._comfy(awf, _T2A["save"], self.valves.AUDIO_TIMEOUT, label, __event_emitter__)
-                        apath = os.path.join(tmp, "music.mp3")
-                        open(apath, "wb").write(audio)
-                        fade = max(0.0, total - 1.5)
-                        await self._ffmpeg(["ffmpeg", "-y", "-v", "error", "-i", joined, "-i", apath, "-map", "0:v", "-map", "1:a",
-                                            "-c:v", "copy", "-af", f"afade=t=out:st={fade:.2f}:d=1.5", "-c:a", "aac",
-                                            "-t", f"{total:.3f}", final])
-                movie = open(final, "rb").read()
+            clips = []
+            for i in chosen:
+                data = await self._read_file(videos[i]["id"], __user__) if videos[i]["id"] else None
+                if not data:
+                    return self._error(f"Could not read video #{i + 1}.")
+                clips.append(data)
+            audio = None
+            if mode == "song":
+                songs = await self._chat_media(__metadata__, __chat_id__, __message_id__, "audio/")
+                if not songs:
+                    return self._error('No music in this chat yet: use soundtrack="new" or generate_music first.')
+                r = (song_ref or "latest").strip().lower().lstrip("#")
+                si = len(songs) - 1 if r in ("", "latest", "last") else int(r) - 1 if r.isdigit() else -1
+                if not 0 <= si < len(songs):
+                    return self._error(f"song_ref {song_ref!r}: this chat has {len(songs)} audio track(s).")
+                audio = await self._read_file(songs[si]["id"], __user__)
+            elif mode == "new" and not (music_style or "").strip():
+                return self._error('soundtrack="new" needs music_style.')
+            movie, total = await self._assemble(clips, mode, audio, music_style, "", label, __event_emitter__)
         except ComfyError as e:
             await self._status(__event_emitter__, f"{label}: failed", done=True)
             return self._error(str(e))
         took = round(time.monotonic() - t0, 1)
         try:
-            new_id = await self._publish("video", movie, "video/mp4", __request__, __user__, __metadata__,
-                                         __chat_id__, __message_id__, __event_emitter__)
+            await self._publish("video", movie, "video/mp4", __request__, __user__, __metadata__,
+                                __chat_id__, __message_id__, __event_emitter__)
         except Exception as e:
             return self._error(f"Movie made, but saving to Open WebUI failed: {type(e).__name__}: {e}")
         await self._status(__event_emitter__, f"{label}: {round(total, 1)}s movie in {took}s", done=True)
@@ -414,6 +370,218 @@ class Tools:
                              "briefly describe the finished movie."}
         return HTMLResponse(content=self._media_embed("video", movie, "video/mp4", mode != "none"),
                             headers={"Content-Disposition": "inline"}), json.dumps(status)
+
+    async def make_story_film(
+        self,
+        shots: str,
+        character: str,
+        style: str = "cinematic photoreal, soft natural lighting, shallow depth of field",
+        seconds_per_shot: int = 4,
+        music_style: str = "",
+        lyrics: str = "",
+        character_ref: str = "",
+        __request__=None,
+        __user__: dict = None,
+        __metadata__: dict = None,
+        __chat_id__: str = None,
+        __message_id__: str = None,
+        __event_emitter__: Callable[[dict], Any] = None,
+    ) -> Any:
+        """
+        Make a complete short film (about 15-30 s) from a story: several shots of 3-5 s each with the same
+        character(s) throughout and one continuous soundtrack. Use this whenever the user wants a story video,
+        short film or anything longer than one clip. Takes about 1-1.5 minutes per shot.
+
+        How it works: one clean character sheet image is made first (or taken from character_ref); every shot's
+        keyframe is an edit of that sheet into the shot's scene (so the character stays identical and no props carry
+        over), then each keyframe is animated. A shot marked "continue" starts from the last frame of the previous
+        shot instead, so the action flows across the cut.
+
+        :param shots: JSON array of 4-8 shots in story order, e.g.
+            [{"scene": "the robot stands alone in a rainy neon alley at night, looking around", "action": "rain falls, the robot slowly turns its head"},
+             {"scene": "...", "action": "...", "continue": true}].
+            "scene" = what the keyframe shows (setting, pose, framing, lighting); "action" = the motion during the shot;
+            "continue": true = pick up exactly where the previous shot ended (same place, continuous action; no "scene" needed).
+            Describe the character the same way in every shot.
+        :param character: Detailed, fixed description of the main character(s): body, colors, materials, face/eyes, clothing,
+            size. Used for the character sheet and repeated in every shot.
+        :param style: One visual style for the whole film, repeated in every prompt. Default "cinematic photoreal, soft natural lighting, shallow depth of field".
+        :param seconds_per_shot: 3-5 seconds per shot. Default 4.
+        :param music_style: Music style tags for one continuous soundtrack under the whole film. Empty = an instrumental cinematic score.
+        :param lyrics: Optional song lyrics for the soundtrack ([verse]/[chorus] markers). Leave empty for instrumental.
+        :param character_ref: Optional image number of an existing image to use as the character sheet instead of making a new one.
+        :return: Status JSON. The film and its keyframes are already shown to the user in the chat.
+        """
+        import os
+        import tempfile
+
+        try:
+            plan = json.loads(shots) if isinstance(shots, str) else shots
+            if isinstance(plan, dict):
+                plan = plan.get("shots") or []
+        except Exception:
+            plan = [{"scene": line.strip(" -*"), "action": line.strip(" -*")} for line in str(shots).splitlines() if line.strip()]
+        plan = [p if isinstance(p, dict) else {"scene": str(p), "action": str(p)} for p in plan]
+        if not 2 <= len(plan) <= 10:
+            return self._error(f"Give 2-10 shots (got {len(plan)}); 4-8 shots of 3-5 s make a 15-30 s film.")
+        plan[0]["continue"] = False
+        secs = max(3, min(int(seconds_per_shot or 4), 5))
+        style = (style or "").strip() or "cinematic photoreal"
+        character = (character or "").strip()
+        n = len(plan)
+        label = f"Story film: {n} shots x {secs}s"
+        await self._status(__event_emitter__, label)
+        t0 = time.monotonic()
+        ctx = (__request__, __user__, __metadata__, __chat_id__, __message_id__, __event_emitter__)
+        try:
+            # 1. character sheet
+            if (character_ref or "").strip():
+                sheet, sheet_label = await self._pick_image(__user__, __metadata__, __chat_id__, __message_id__, character_ref)
+            else:
+                await self._status(__event_emitter__, f"{label}: character sheet")
+                w, h = _IMAGE_SIZES["landscape"]
+                sheet = await self._comfy(self._t2i_wf(
+                    f"Character reference sheet: {character}. Full body, standing, centered, facing the camera, "
+                    f"whole character clearly visible, simple neutral background. {style}.", w, h),
+                    _IMG["save"], self.valves.IMAGE_TIMEOUT, f"{label}: character sheet", __event_emitter__)
+                await self._publish("image", sheet, "image/png", *ctx)
+                sheet_label = "a new character sheet"
+            sheet_up = await self._upload(sheet)
+
+            # 2. shots
+            clips, report = [], []
+            with tempfile.TemporaryDirectory() as tmp:
+                prev_clip = None
+                for i, shot in enumerate(plan, start=1):
+                    scene = str(shot.get("scene") or shot.get("description") or "").strip()
+                    action = str(shot.get("action") or scene).strip()
+                    cont = bool(shot.get("continue")) and prev_clip is not None
+                    tag = f"{label}: shot {i}/{n}"
+                    if cont:
+                        p = os.path.join(tmp, f"clip{i - 1}.mp4"); open(p, "wb").write(prev_clip)
+                        f = os.path.join(tmp, f"last{i - 1}.png")
+                        await self._ffmpeg(["ffmpeg", "-y", "-v", "error", "-sseof", "-0.15", "-i", p, "-frames:v", "1", "-update", "1", f])
+                        start = open(f, "rb").read()
+                    else:
+                        await self._status(__event_emitter__, f"{tag}: keyframe")
+                        start = await self._comfy(self._edit_wf(sheet_up,
+                            f"Place the character from Picture 1 into a new scene: {scene}. The character is {character}. "
+                            f"Keep the character's design, colors, materials, proportions and face exactly as in Picture 1. "
+                            f"Replace the whole background and remove anything from Picture 1 that does not belong in this scene. "
+                            f"Style: {style}."),
+                            _EDIT["save"], self.valves.IMAGE_TIMEOUT, f"{tag}: keyframe", __event_emitter__)
+                        await self._publish("image", start, "image/png", *ctx)
+                    up = await self._upload(start)
+                    w, h = self._video_size_for(start)
+                    await self._status(__event_emitter__, f"{tag}: animating")
+                    clip = await self._comfy(self._i2v_wf(up,
+                        f"{action}. {character}, keeping exactly the same appearance and colors throughout. {style}. "
+                        f"Smooth natural motion, stable camera.", w, h, secs),
+                        _I2V["save"], self.valves.VIDEO_TIMEOUT, f"{tag}: animating", __event_emitter__)
+                    clips.append(clip)
+                    prev_clip = clip
+                    report.append({"shot": i, "seconds": secs, "start": "continues from previous shot" if cont else "new keyframe"})
+
+            # 3. assemble + soundtrack
+            movie, total = await self._assemble(clips, "new", None,
+                                                (music_style or "").strip() or "cinematic orchestral score, emotional, strings, piano",
+                                                lyrics, label, __event_emitter__)
+        except ComfyError as e:
+            await self._status(__event_emitter__, f"{label}: failed", done=True)
+            return self._error(str(e))
+        took = round(time.monotonic() - t0, 1)
+        try:
+            await self._publish("video", movie, "video/mp4", *ctx)
+        except Exception as e:
+            return self._error(f"Film made, but saving to Open WebUI failed: {type(e).__name__}: {e}")
+        await self._status(__event_emitter__, f"{label}: {round(total, 1)}s film in {round(took / 60, 1)} min", done=True)
+        status = {"status": "success", "minutes_taken": round(took / 60, 1), "film_seconds": round(total, 1),
+                  "shots": report, "character_sheet": sheet_label,
+                  "message": "The finished film (with soundtrack) and the shot keyframes are already visible to the user. "
+                             "Do not repeat links; briefly describe the film shot by shot."}
+        return HTMLResponse(content=self._media_embed("video", movie, "video/mp4", True),
+                            headers={"Content-Disposition": "inline"}), json.dumps(status)
+
+    # --------------------------------------------------------------- film helpers
+
+    def _t2i_wf(self, prompt: str, w: int, h: int) -> dict:
+        wf = self._template("z_image_turbo")
+        wf[_IMG["prompt"]]["inputs"]["text"] = prompt
+        wf[_IMG["latent"]]["inputs"]["width"] = w
+        wf[_IMG["latent"]]["inputs"]["height"] = h
+        wf[_IMG["sampler"]]["inputs"]["seed"] = random.randint(0, 2**32 - 1)
+        return wf
+
+    def _edit_wf(self, base_uploaded: str, instruction: str) -> dict:
+        wf = self._template("qwen_image_edit")
+        wf[_EDIT["image"]]["inputs"]["image"] = base_uploaded
+        wf[_EDIT["prompt"]]["inputs"]["value"] = instruction
+        wf[_EDIT["sampler"]]["inputs"]["seed"] = random.randint(0, 2**32 - 1)
+        return wf
+
+    def _i2v_wf(self, uploaded: str, prompt: str, w: int, h: int, secs: int) -> dict:
+        wf = self._template("wan22_i2v")
+        wf[_I2V["image"]]["inputs"]["image"] = uploaded
+        wf[_I2V["prompt"]]["inputs"]["text"] = prompt
+        wf[_I2V["latent"]]["inputs"]["width"] = w
+        wf[_I2V["latent"]]["inputs"]["height"] = h
+        wf[_I2V["latent"]]["inputs"]["length"] = secs * 16 + 1
+        wf[_I2V["lora"]]["inputs"]["value"] = True
+        wf[_I2V["sampler"]]["inputs"]["noise_seed"] = random.randint(0, 2**32 - 1)
+        return wf
+
+    async def _assemble(self, clips: list, mode: str, audio, music_style: str, lyrics: str, label: str, emitter) -> tuple:
+        """Normalise + concatenate clip bytes; soundtrack mode clips/song/new/none. Returns (mp4 bytes, seconds)."""
+        import os
+        import tempfile
+
+        with tempfile.TemporaryDirectory() as tmp:
+            paths = []
+            for k, data in enumerate(clips):
+                p = os.path.join(tmp, f"in{k}.mp4"); open(p, "wb").write(data); paths.append(p)
+            w, h = await self._probe_size(paths[0])
+            infos = [await self._stream_info(c) for c in paths]
+            uniform = len({(i["w"], i["h"], i["fps"], i["codec"], i["audio"]) for i in infos}) == 1
+            parts = []
+            if uniform:  # clips from the same pipeline: join without re-encoding (fast, a few MB of memory)
+                parts = paths
+            for k, c in enumerate([] if uniform else paths):  # mixed clips: same size/fps, every clip gets an audio track
+                out = os.path.join(tmp, f"norm{k}.mp4")
+                has_audio = await self._has_audio(c)
+                cmd = ["ffmpeg", "-y", "-v", "error", "-i", c]
+                if not has_audio:
+                    cmd += ["-f", "lavfi", "-i", "anullsrc=r=44100:cl=stereo"]
+                cmd += ["-vf", f"scale={w}:{h}:force_original_aspect_ratio=decrease,pad={w}:{h}:(ow-iw)/2:(oh-ih)/2,fps=16,format=yuv420p",
+                        "-c:v", "libx264", "-preset", "veryfast", "-crf", "18", "-threads", "2",
+                        "-c:a", "aac", "-ar", "44100", "-ac", "2"]
+                if not has_audio:
+                    cmd += ["-shortest"]
+                await self._ffmpeg(cmd + [out])
+                parts.append(out)
+            listing = os.path.join(tmp, "list.txt")
+            open(listing, "w").write("".join(f"file '{p}'\n" for p in parts))
+            joined = os.path.join(tmp, "joined.mp4")
+            await self._ffmpeg(["ffmpeg", "-y", "-v", "error", "-f", "concat", "-safe", "0", "-i", listing, "-c", "copy", joined])
+            total = await self._duration(joined)
+            final = joined
+            if mode == "none":
+                final = os.path.join(tmp, "final.mp4")
+                await self._ffmpeg(["ffmpeg", "-y", "-v", "error", "-i", joined, "-an", "-c:v", "copy", final])
+            elif mode in ("song", "new"):
+                if mode == "new":
+                    await self._status(emitter, f"{label}: composing a {round(total)}s soundtrack")
+                    awf = self._template("ace_step_t2a")
+                    awf[_T2A["encode"]]["inputs"]["tags"] = music_style
+                    awf[_T2A["encode"]]["inputs"]["lyrics"] = (lyrics or "").strip() or "[inst]"
+                    awf[_T2A["latent"]]["inputs"]["seconds"] = max(5, int(total + 1))
+                    awf[_T2A["sampler"]]["inputs"]["seed"] = random.randint(0, 2**32 - 1)
+                    audio = await self._comfy(awf, _T2A["save"], self.valves.AUDIO_TIMEOUT, f"{label}: soundtrack", emitter)
+                apath = os.path.join(tmp, "music.mp3"); open(apath, "wb").write(audio)
+                final = os.path.join(tmp, "final.mp4")
+                await self._ffmpeg(["ffmpeg", "-y", "-v", "error", "-i", joined, "-i", apath, "-map", "0:v", "-map", "1:a",
+                                    "-c:v", "copy", "-af", f"afade=t=out:st={max(0.0, total - 1.5):.2f}:d=1.5", "-c:a", "aac",
+                                    "-t", f"{total:.3f}", final])
+            return open(final, "rb").read(), total
 
     # --------------------------------------------------------------- ffmpeg helpers
 
@@ -430,6 +598,13 @@ class Tools:
                                   "-of", "csv=p=0", path])
         w, h = out.strip().split(",")[:2]
         return int(w), int(h)
+
+    async def _stream_info(self, path: str) -> dict:
+        out = await self._ffmpeg(["ffprobe", "-v", "error", "-select_streams", "v:0", "-show_entries",
+                                  "stream=width,height,r_frame_rate,codec_name", "-of", "json", path])
+        v = (json.loads(out).get("streams") or [{}])[0]
+        return {"w": v.get("width"), "h": v.get("height"), "fps": v.get("r_frame_rate"),
+                "codec": v.get("codec_name"), "audio": await self._has_audio(path)}
 
     async def _has_audio(self, path: str) -> bool:
         out = await self._ffmpeg(["ffprobe", "-v", "error", "-select_streams", "a", "-show_entries", "stream=index",
