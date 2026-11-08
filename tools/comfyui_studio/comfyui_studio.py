@@ -95,6 +95,7 @@ class Tools:
     async def edit_image(
         self,
         instruction: str,
+        image_ref: str = "latest",
         __request__=None,
         __user__: dict = None,
         __metadata__: dict = None,
@@ -111,10 +112,14 @@ class Tools:
         "remove the person on the left", "turn this into a watercolor".
 
         :param instruction: The edit to make, written as an instruction (e.g. "Replace the cat with a dalmatian").
+            Say explicitly what must stay unchanged (e.g. "keep the robot's brass color and design").
+        :param image_ref: Which image to start from: "latest" (default: the newest image in the chat, or the one the user
+            just attached), "previous", "first", or an image number such as "1" (every image result reports its number).
+            To keep a character consistent in a new scene, pass the number of the image that shows that character best.
         :return: Status JSON. The edited image is already shown to the user in the chat.
         """
         try:
-            src, src_name = await self._latest_image(__user__, __metadata__, __chat_id__, __message_id__)
+            src, src_name = await self._pick_image(__user__, __metadata__, __chat_id__, __message_id__, image_ref)
         except ComfyError as e:
             return self._error(str(e))
         await self._status(__event_emitter__, f"Uploading {src_name} to ComfyUI")
@@ -182,6 +187,7 @@ class Tools:
         prompt: str,
         seconds: int = 5,
         music_style: str = "",
+        image_ref: str = "latest",
         __request__=None,
         __user__: dict = None,
         __metadata__: dict = None,
@@ -201,10 +207,13 @@ class Tools:
         :param music_style: Optional. To give the clip a generated music soundtrack (one MP4 with sound), set this to
             comma-separated music style tags, e.g. "cinematic ambient, soft strings, slow". Use it whenever the user asks
             for sound, music or a soundtrack with the video. Leave empty for a silent clip. (Music only, not sound effects.)
+        :param image_ref: Which image to start from: "latest" (default: the newest image in the chat, or the one the user
+            just attached), "previous", "first", or an image number such as "1" (every image result reports its number).
+            To keep a character consistent in a new scene, pass the number of the image that shows that character best.
         :return: Status JSON. The video is already shown to the user in the chat.
         """
         try:
-            src, src_name = await self._latest_image(__user__, __metadata__, __chat_id__, __message_id__)
+            src, src_name = await self._pick_image(__user__, __metadata__, __chat_id__, __message_id__, image_ref)
         except ComfyError as e:
             return self._error(str(e))
         secs = max(1, min(int(seconds or 5), self.valves.MAX_VIDEO_SECONDS))
@@ -383,7 +392,7 @@ class Tools:
         took = round(time.monotonic() - t0, 1)
 
         try:
-            await self._publish(kind, data, content_type, request, user, metadata, chat_id, message_id, emitter)
+            new_id = await self._publish(kind, data, content_type, request, user, metadata, chat_id, message_id, emitter)
         except Exception as e:
             await self._status(emitter, f"{label}: could not save result", done=True)
             return self._error(f"Generated, but saving to Open WebUI failed: {type(e).__name__}: {e}")
@@ -397,6 +406,17 @@ class Tools:
                        f"markdown for it; just briefly describe what was made.",
         })
         if kind == "image":
+            try:
+                ids = [i["id"] for i in await self._chat_images(metadata, chat_id, message_id)]
+                number = ids.index(new_id) + 1 if new_id in ids else None
+            except Exception:
+                number = None
+            if number:
+                status = json.loads(status_json)
+                status["image_number"] = number
+                status["message"] += (f" This is image #{number} in the chat; pass image_ref=\"{number}\" to "
+                                      f"edit_image/animate_image to start from it later.")
+                status_json = json.dumps(status)
             return status_json
         # Assistant messages render image files inline but show other files only as a
         # download card (video: not at all), so play audio/video from an inline embed.
@@ -453,12 +473,11 @@ class Tools:
                 files = saved
         if emitter:
             await emitter({"type": "chat:message:files", "data": {"files": files}})
+        return item.id
 
-    async def _latest_image(self, user, metadata, chat_id, message_id) -> tuple:
-        """Return (bytes, name) of the newest image: current attachments first, then chat history."""
-        candidates = []
-        for f in reversed((metadata or {}).get("files") or []):
-            candidates.append(f)
+    async def _chat_images(self, metadata, chat_id, message_id) -> list:
+        """All images in this chat (user attachments and generated), oldest first, de-duplicated by file id."""
+        per_message = []
         if chat_id:
             try:
                 from open_webui.models.chats import Chats
@@ -468,33 +487,58 @@ class Tools:
                 msgs = history.get("messages", {}) or {}
                 mid = message_id if message_id in msgs else history.get("currentId")
                 seen = set()
-                while mid and mid in msgs and mid not in seen:
+                while mid and mid in msgs and mid not in seen:  # newest -> root
                     seen.add(mid)
-                    m = msgs[mid]
-                    candidates.extend(reversed(m.get("files") or []))
-                    mid = m.get("parentId")
+                    per_message.append(msgs[mid].get("files") or [])
+                    mid = msgs[mid].get("parentId")
             except Exception:
                 pass
+        ordered = [f for files in reversed(per_message) for f in files]
+        ordered += list((metadata or {}).get("files") or [])  # current attachments (may not be saved yet)
 
-        for f in candidates:
+        images, ids = [], set()
+        for f in ordered:
             if not isinstance(f, dict):
                 continue
             ctype = str(f.get("content_type") or ((f.get("file") or {}).get("meta") or {}).get("content_type") or "")
             if not (f.get("type") == "image" or ctype.startswith("image/")):
                 continue
             url = str(f.get("url") or "")
-            if url.startswith("data:image/"):
-                return base64.b64decode(url.split(",", 1)[1]), f.get("name") or "the image"
             fid = f.get("id") or (f.get("file") or {}).get("id")
-            if not fid:
+            if not fid and not url.startswith("data:image/"):
                 m = _FILE_ID_RE.search(url)
                 fid = m.group(1) if m else None
-            if not fid:
+            key = fid or url[:200]
+            if not key or key in ids:
                 continue
-            data = await self._read_file(fid, user)
-            if data:
-                return data, f.get("name") or "the image"
-        raise ComfyError("No image found. Ask the user to attach an image (or generate one first).")
+            ids.add(key)
+            images.append({"id": fid, "url": url, "name": f.get("name") or "image"})
+        return images
+
+    async def _pick_image(self, user, metadata, chat_id, message_id, ref="latest") -> tuple:
+        """Return (bytes, label) for image_ref: latest / previous / first / a 1-based image number."""
+        images = await self._chat_images(metadata, chat_id, message_id)
+        if not images:
+            raise ComfyError("No image found. Ask the user to attach an image (or generate one first).")
+        r = str(ref or "latest").strip().lower().lstrip("#").replace("image", "").strip()
+        if r in ("", "latest", "last", "newest", "current"):
+            idx = len(images) - 1
+        elif r in ("previous", "prev", "second-to-last"):
+            idx = max(0, len(images) - 2)
+        elif r in ("first", "original"):
+            idx = 0
+        elif r.isdigit() and 1 <= int(r) <= len(images):
+            idx = int(r) - 1
+        else:
+            raise ComfyError(f"image_ref {ref!r} not found: this chat has {len(images)} image(s), numbered 1-{len(images)}.")
+        img = images[idx]
+        if img["url"].startswith("data:image/"):
+            data = base64.b64decode(img["url"].split(",", 1)[1])
+        else:
+            data = await self._read_file(img["id"], user) if img["id"] else None
+        if not data:
+            raise ComfyError(f"Could not read image #{idx + 1} ({img['name']}).")
+        return data, f"image #{idx + 1}"
 
     @staticmethod
     async def _read_file(file_id: str, user: dict) -> Optional[bytes]:
