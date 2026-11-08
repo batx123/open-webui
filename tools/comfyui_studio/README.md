@@ -11,7 +11,8 @@ soundtrack) and music to Open WebUI chats, using a local ComfyUI server.
 | `animate_image` | Wan2.2 14B image-to-video | ~45 s per 3 s clip |
 | `generate_music` | ACE-Step 3.5B | ~10 s per 15 s |
 | `make_movie` | ffmpeg (in the Open WebUI pod) | seconds |
-| `make_story_film` | all of the above: character sheet → per-shot keyframe edits → i2v → one soundtrack | ~1-1.5 min per shot (20 s film ≈ 5.5 min) |
+| `make_story_film` | all of the above: one sheet per character → per-shot keyframe edits (that shot's cast) → i2v → one soundtrack | ~1-1.5 min per shot (20 s film ≈ 6 min) |
+| `redo_shot` | regenerates one shot (+ dependent `continue` shots), rebuilds the film with the same soundtrack | ~1-2 min |
 
 `generate_video` and `animate_image` take an optional `music_style`. When it's set, the
 ACE-Step graph is merged into the video graph and wired into `CreateVideo`'s audio input, so
@@ -37,8 +38,11 @@ attached to the latest message, or otherwise the most recent image in the chat.
 
 ## Story films
 
-`make_story_film` takes a JSON shot list written by the model (`scene`, `action`, optional `continue`), one
-`character` description and one `style`. Every keyframe is an edit of a single character sheet (so the character
-stays identical and props don't carry over); a `continue` shot starts from the previous clip's last frame. Uniform
+`make_story_film` takes a JSON shot list written by the model (`scene`, `action`, `cast`, optional `continue`), a
+JSON list of `characters` (each described separately) and one `style`. Each character gets its own reference sheet;
+every keyframe places exactly that shot's cast (Qwen-Image-Edit Picture 1-3) into the scene, so characters stay
+identical and only appear when the story says so. A `continue` shot starts from the previous clip's last frame (and is
+re-framed if it has its own `scene`). Each film saves a `comfy-film-*.json` project (shots, sheets, clips, soundtrack)
+in the chat, which `redo_shot` uses to replace one shot without touching the others. Uniform
 clips are joined with a stream copy (no re-encode, ~55 MB peak), and one ACE-Step soundtrack covers the whole film.
 Give the Open WebUI container a 4Gi memory limit: at 2Gi it was OOM-killed during a film (it idles at ~1Gi).
