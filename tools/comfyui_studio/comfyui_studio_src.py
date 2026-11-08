@@ -679,6 +679,16 @@ class Tools:
                   "and with the expressions the scene calls for, looking at each other or at what is happening, never "
                   "at the camera and never posing or smiling for the camera.")
         feel = f"Facial expressions and mood: {expr}." if expr else ""
+        if cast:
+            names = ", ".join(c["name"] for c in cast)
+            others = [c["name"] for c in cast_list if c not in cast]
+            lock += (f" Each of {names} appears exactly once and is clearly visible and recognizable (face, hair and "
+                     f"outfit exactly as in its picture), even when small or inside a vehicle (seen through a window). "
+                     f"Any other people in the scene (extras such as a bank teller, police or passers-by) are clearly "
+                     f"different people who look nothing like {names}: different age, face, hair and clothes; nobody "
+                     f"else wears their outfits.")
+            if others:
+                lock += f" {', '.join(others)} {'is' if len(others) == 1 else 'are'} not in this shot."
         return cast, who, lock, candid, feel
 
     async def _shot_keyframe(self, i, n, shot, base, cast_list, style, label, ctx) -> tuple:
