@@ -21,12 +21,19 @@ spec:
         env:
         - name: OLLAMA_BASE_URL
           value: "http://ollama-service:11434"  # In-cluster DNS — resolves within the open-webui namespace, no LAN IP needed
+        # Pinned so logins survive restarts (otherwise a new key is generated on every start).
+        # Secret is created out of band: kubectl create secret generic open-webui-secret -n open-webui --from-literal=WEBUI_SECRET_KEY=...
+        - name: WEBUI_SECRET_KEY
+          valueFrom:
+            secretKeyRef:
+              name: open-webui-secret
+              key: WEBUI_SECRET_KEY
         ports:
         - containerPort: 8080
         resources:
           limits:
             cpu: "1000m"
-            memory: 2Gi
+            memory: 4Gi  # 2Gi OOMKilled during ComfyUI Studio story films (idles ~1Gi)
           requests:
             cpu: "500m"
             memory: 768Mi
